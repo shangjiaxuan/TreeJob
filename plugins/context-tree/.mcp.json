@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "context_tree": {
+      "command": "node",
+      "args": ["./dist/mcp.mjs"],
+      "cwd": ".",
+      "startup_timeout_sec": 15,
+      "tool_timeout_sec": 30
+    }
+  }
+}

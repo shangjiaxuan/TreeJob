@@ -1,0 +1,12 @@
+{
+  "name": "tree-context-local",
+  "interface": { "displayName": "Tree Context Local" },
+  "plugins": [
+    {
+      "name": "context-tree",
+      "source": { "source": "local", "path": "./plugins/context-tree" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "name": "tree-context-workspace",
+  "private": true,
+  "scripts": {
+    "build": "npm --prefix plugins/context-tree run build",
+    "test": "npm --prefix plugins/context-tree test",
+    "validate": "npm --prefix plugins/context-tree run validate"
+  }
+}

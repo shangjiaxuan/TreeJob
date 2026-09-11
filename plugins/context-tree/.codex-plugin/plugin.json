@@ -1,0 +1,17 @@
+{
+  "name": "context-tree",
+  "version": "0.1.0",
+  "description": "Persistent tree-shaped continuation state for Codex sessions.",
+  "author": { "name": "TreeContext" },
+  "mcpServers": "./.mcp.json",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Context Tree",
+    "shortDescription": "Persistent execution context and continuation trees.",
+    "longDescription": "Stores explicit task cursors, detours, and compact proposals in a local daemon.",
+    "developerName": "TreeContext",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": ["Show my current continuation context.", "Create a child context for this detour.", "Resolve my pending compact proposal."]
+  }
+}

@@ -1,0 +1,21 @@
+{
+    "type": "object",
+    "properties": {
+        "currentState": {
+            "type": "string"
+        },
+        "openQuestions": {
+            "type": "array",
+            "items": {
+                "type": "string"
+            }
+        },
+        "returnCondition": {
+            "type": "string"
+        },
+        "summary": {
+            "type": "string"
+        }
+    },
+    "additionalProperties": false
+}
