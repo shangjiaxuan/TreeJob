@@ -1,21 +1,16 @@
 {
-    "type": "object",
-    "properties": {
-        "currentState": {
-            "type": "string"
-        },
-        "openQuestions": {
-            "type": "array",
-            "items": {
-                "type": "string"
-            }
-        },
-        "returnCondition": {
-            "type": "string"
-        },
-        "summary": {
-            "type": "string"
-        }
-    },
-    "additionalProperties": false
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "kind": { "type": "string" },
+    "title": { "type": "string" },
+    "objective": { "type": "string" },
+    "rationale": { "type": "string" },
+    "currentState": { "type": "string" },
+    "openQuestions": { "type": "array", "items": { "type": "string" } },
+    "returnCondition": { "type": "string" },
+    "refs": { "type": "array" },
+    "metadata": { "type": "object" },
+    "status": { "enum": ["open", "blocked", "done", "abandoned", "superseded"] }
+  }
 }

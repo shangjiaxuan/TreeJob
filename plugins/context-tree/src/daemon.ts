@@ -1,7 +1,7 @@
 /** Local socket framing and daemon lifetime only. */
 import net from "node:net";
 import { existsSync, rmSync } from "node:fs";
-import { ContinuationController } from "./daemon-service.js";
+import { FilesystemOperations } from "./daemon-service.js";
 import { endpoint, releaseStartLock } from "./rpc.js";
 import {
   OperationSchemas,
@@ -9,7 +9,7 @@ import {
   RpcRequestSchema,
 } from "./schema.js";
 
-const controller = new ContinuationController();
+const controller = new FilesystemOperations();
 const socketEndpoint = endpoint();
 
 if (process.platform !== "win32" && existsSync(socketEndpoint)) {
@@ -77,7 +77,7 @@ function writeResponse(socket: net.Socket, line: string): void {
     const request = RpcRequestSchema.parse(JSON.parse(line));
     id = request.id;
     const result = OperationSchemas[request.method].output.parse(
-      controller.dispatch(request.method, request.params),
+      controller.dispatch(request.method, request.params, request.idempotencyKey),
     );
     socket.write(JSON.stringify({
       protocolVersion: PROTOCOL_VERSION,

@@ -1,9 +1,10 @@
 # Context Tree
 
-Context Tree is a local persistent task stack for Codex. It keeps a
-continuation tree separate from transcript history: each record describes the
-current work, why it matters, what remains, when to return, and pointers to
-durable logs or notes.
+Context Tree is a local persistent continuation notebook for Codex. Its v3
+public API is a cursor-relative virtual filesystem: named nodes carry work
+payloads and can contain child nodes. Immutable snapshots, node revisions,
+entry revisions, and copy-on-write directory revisions remain implementation
+details behind the daemon.
 
 The plugin runtime is bundled in the checked-in dist directory. A fresh
 marketplace checkout can therefore run its MCP server and hooks on Node 22 or
@@ -26,22 +27,26 @@ directory explicitly:
 
     npm run shell -- --data-dir C:/temp/context-tree-trial
 
-The shell displays both the compact active path and an ancestor briefing. Its
-commands are:
+The shell prints the exact compact daemon result. Its commands are:
 
-    registerSession --sessionId notebook-trial --cwd C:/work/repo
-    getContext --sessionId notebook-trial
-    updateRecord --sessionId notebook-trial --patch '{"objective":"Ship it"}'
-    pushChild --sessionId notebook-trial --fields '{"kind":"plan", ...}' --enter true
-    closeRecord --sessionId notebook-trial --summary "Checked migration safety"
-    searchContext --sessionId notebook-trial --query migration --scope session_tree
+    pwd --sessionId notebook-trial --cwd C:/work/repo
+    mkdir --sessionId notebook-trial --name migration --work '{"objective":"Ship it"}'
+    cd --sessionId notebook-trial --path migration
+    edit --sessionId notebook-trial --patch '{"currentState":"Checking schema safety"}'
+    rev-list --sessionId notebook-trial --path /migration
+    close --sessionId notebook-trial --summary "Checked migration safety" --status done
+    search --sessionId notebook-trial --query migration --scope subtree
     describe
     quit
 
-The intended trial is to initialize a goal, add a plan, job, and detour, close
-the detour, and return upward. The briefing should make the next action, its
-reason, open questions, evidence pointers, and closed-detour outcome clear
-without rereading a transcript.
+Paths use `/`; `\\` escapes literal `/`, `\\`, `.` and `..` names. Names are
+Unicode NFC and case-sensitive. `mv` retains node and entry identity for a
+same-name move; a rename writes an entry revision. `rev-list` reports the
+chronological node-revision line, labelling payload and directory changes.
+
+Set `CONTEXT_TREE_DEBUG=1` for daemon-owned JSONL diagnostics in the data
+directory. It logs operation metadata but not work content. Set
+`CONTEXT_TREE_DEBUG_CONTEXT=1` to include diagnostic result content.
 
 ## Runtime updates
 

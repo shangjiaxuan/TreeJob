@@ -52,7 +52,7 @@ export type OperationMetadata = {
 };
 
 export type ContractMetadata = {
-  version: 1;
+  version: 2;
   schemas: Record<string, ContractSpec>;
   operations: Record<string, OperationMetadata>;
 };

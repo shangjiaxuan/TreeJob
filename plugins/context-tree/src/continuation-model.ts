@@ -1,753 +1,777 @@
+import { platform } from "node:os";
 import { resolve } from "node:path";
 import {
-  ContextSchema,
-  CursorSchema,
-  PayloadFieldsSchema,
-  type Context,
-  type Cursor,
-  type DirectoryInode,
-  type InodeId,
-  type PayloadFields,
-  type PayloadInode,
-  type Proposal,
-  type Snapshot,
-} from "./schema.js";
-import {
-  type RecordRepository,
   RepositoryError,
+  type Cursor,
+  type DirectoryRevision,
+  type EntryRevision,
+  type Membership,
+  type NodeRevision,
+  type PayloadRevision,
+  type Proposal,
+  type RecordRepository,
+  type Session,
+  type Snapshot,
+  type Workspace,
 } from "./record-repository.js";
-import type { SessionState, Workspace } from "./schema.js";
+import {
+  WorkFieldsSchema,
+  IdSchema,
+  type Id,
+  type ProposalDecision,
+  type ProposalKind,
+  type RecordStatus,
+  type WorkFields,
+  type WorkPatch,
+} from "./schema.js";
 
-const terminalStatuses = new Set(["done", "abandoned", "superseded"]);
+const terminal = new Set<RecordStatus>(["done", "abandoned", "superseded"]);
 
-export type ModelMutation = {
-  nextRootDirectoryId: InodeId;
-  nextCursorPath: InodeId[];
-  journalPayload: unknown;
+export type ResolvedNode = {
+  nodeRevision: NodeRevision;
+  payload: PayloadRevision;
+  directory: DirectoryRevision;
+  memberships: Membership[];
+  entryPath: Id[];
+  names: string[];
 };
 
-export type NewSessionState = {
-  workspace: Workspace;
-  session: SessionState;
+export type ResolvedSession = {
+  session: Session;
+  snapshot: Snapshot;
   cursor: Cursor;
+  nodes: ResolvedNode[];
 };
 
-export type ProposalDecision = {
-  mutation: ModelMutation | undefined;
-  proposalStatus: "applied" | "rejected" | "discarded";
+type DirectoryEdit = {
+  remove: Set<Id>;
+  add: Membership[];
+};
+
+type PathSegment = {
+  value: string;
+  escaped: boolean;
 };
 
 export class ContinuationModel {
   constructor(private readonly records: RecordRepository) {}
 
-  createRootSession(sessionId: string, cwd: string): NewSessionState {
-    const canonicalPath = resolve(cwd).toLowerCase();
-    const existingWorkspace = this.records.findWorkspaceByPath(canonicalPath);
-    const workspace = existingWorkspace ?? this.records.insertWorkspace({
-      canonicalPath,
-      createdAt: this.timestamp(),
+  createSession(sessionId: string, cwd: string): ResolvedSession {
+    const canonicalPath = this.canonicalWorkspacePath(cwd);
+    const workspace = this.records.findWorkspace(canonicalPath) ??
+      this.records.insertWorkspace(canonicalPath);
+    const root = this.createNode({
+      kind: "node",
+      title: "",
+      objective: "",
+      rationale: "",
+      currentState: "New continuation session.",
+      openQuestions: [],
+      returnCondition: "",
+      refs: [],
+      metadata: {},
+      status: "open",
     });
-    const root = this.createPayload(
-      PayloadFieldsSchema.parse({
-        kind: "root",
-        title: "Session " + sessionId.slice(0, 12),
-        objective: "Initialize the continuation objective.",
-        returnCondition: "Set the root objective and return condition.",
-        currentState: "New continuation session.",
-      }),
-      null,
-    );
-    const rootDirectory = this.createDirectory(root.id, [], null);
-    const snapshot = this.createSnapshot(rootDirectory.id, null);
-    const cursor = this.cursorFor(sessionId, snapshot.id, [root.id]);
-
-    return {
-      workspace,
-      session: {
-        id: sessionId,
-        workspaceId: workspace.id,
-        headSnapshotId: snapshot.id,
-        parentSessionId: null,
-        createdAt: this.timestamp(),
-      },
-      cursor,
+    const snapshot = this.records.insertSnapshot(root.id, null);
+    const session: Session = {
+      id: sessionId,
+      workspaceId: workspace.id,
+      headSnapshotId: snapshot.id,
+      parentSessionId: null,
+      createdAt: this.timestamp(),
     };
+    const cursor: Cursor = {
+      sessionId,
+      snapshotId: snapshot.id,
+      entryPath: [],
+      updatedAt: this.timestamp(),
+    };
+
+    this.records.insertSession(session);
+    this.records.saveCursor(cursor);
+    return this.resolveSession(sessionId);
   }
 
-  context(sessionId: string): Context {
+  validateWorkspace(session: Session, cwd: string): void {
+    const workspace = this.records.getWorkspace(session.workspaceId);
+    const supplied = this.canonicalWorkspacePath(cwd);
+
+    if (workspace.canonicalPath !== supplied) {
+      throw new RepositoryError("conflict", "session is already bound to a different workspace");
+    }
+  }
+
+  resolveSession(sessionId: string): ResolvedSession {
     const session = this.records.getSession(sessionId);
     const snapshot = this.records.getSnapshot(session.headSnapshotId);
     const cursor = this.records.getCursor(sessionId);
 
     if (cursor.snapshotId !== snapshot.id) {
-      throw new RepositoryError(
-        "invariant",
-        "cursor snapshot differs from session head",
+      throw new RepositoryError("invariant", "cursor does not match session head");
+    }
+
+    const nodes: ResolvedNode[] = [];
+    let nodeRevision = this.records.getNodeRevision(snapshot.rootNodeRevisionId);
+    let names: string[] = [];
+    nodes.push(this.resolved(nodeRevision, [], names));
+
+    for (const entryId of cursor.entryPath) {
+      const parent = nodes[nodes.length - 1];
+      if (!parent) throw new RepositoryError("invariant", "missing cursor parent");
+      const membership = parent.memberships.find((member) =>
+        this.records.getEntryRevision(member.entryRevisionId).entryId === entryId
       );
-    }
-
-    const resolvedPath = cursor.inodePath.map((inodeId) =>
-      this.resolveLiveInode(snapshot.id, inodeId),
-    );
-    const currentId = resolvedPath[resolvedPath.length - 1];
-
-    if (!currentId) {
-      throw new RepositoryError("invariant", "cursor path must not be empty");
-    }
-
-    const currentDirectory = this.findDirectory(
-      snapshot.rootDirectoryId,
-      currentId,
-    );
-
-    if (!currentDirectory) {
-      throw new RepositoryError(
-        "invariant",
-        "cursor target is not reachable from session head",
-      );
-    }
-
-    const unresolved = this.payloadIds(snapshot.rootDirectoryId)
-      .map((inodeId) => this.records.getPayload(inodeId))
-      .filter((inode) => !terminalStatuses.has(inode.status));
-    const ancestorBriefing = resolvedPath.map((inodeId) => {
-      const directory = this.findDirectory(snapshot.rootDirectoryId, inodeId);
-
-      if (!directory) {
-        throw new RepositoryError(
-          "invariant",
-          "active ancestor is not reachable from session head",
-        );
+      if (!membership) {
+        throw new RepositoryError("conflict", "cursor entry is not reachable from session head");
       }
+      const entry = this.records.getEntryRevision(membership.entryRevisionId);
+      nodeRevision = this.records.getNodeRevision(membership.childNodeRevisionId);
+      names = [...names, entry.name];
+      nodes.push(this.resolved(nodeRevision, [...parent.entryPath, entryId], names));
+    }
 
-      const childOutcomes = directory.entries
-        .map((entry) => this.records.getDirectory(entry.directoryId))
-        .map((childDirectory) =>
-          this.records.getPayload(childDirectory.payloadId),
-        )
-        .filter((child) => terminalStatuses.has(child.status));
-
-      return {
-        record: this.records.getPayload(inodeId),
-        childOutcomes,
-      };
-    });
-
-    return ContextSchema.parse({
-      sessionId,
-      headSnapshotId: snapshot.id,
-      current: this.records.getPayload(currentId),
-      activePath: resolvedPath.map((inodeId) => this.records.getPayload(inodeId)),
-      children: currentDirectory.entries.map((entry) => {
-        const directory = this.records.getDirectory(entry.directoryId);
-        return this.records.getPayload(directory.payloadId);
-      }),
-      pendingProposals: this.records.listPendingProposals(sessionId),
-      unresolved,
-      ancestorBriefing,
-    });
+    return { session, snapshot, cursor, nodes };
   }
 
-  push(
-    snapshot: Snapshot,
-    cursor: Cursor,
-    fields: PayloadFields,
-    sibling: boolean,
-    enter: boolean,
-  ): ModelMutation {
-    if (!fields.returnCondition) {
-      throw new RepositoryError(
-        "invariant",
-        "returnCondition is required for independently returnable work",
+  resolvePath(resolved: ResolvedSession, rawPath: string | undefined): ResolvedNode {
+    if (!rawPath || rawPath === ".") {
+      return this.current(resolved);
+    }
+
+    const absolute = rawPath.startsWith("/");
+    const segments = this.parsePath(rawPath);
+    let nodes = absolute
+      ? [this.required(resolved.nodes[0], "session has no root node")]
+      : [...resolved.nodes];
+
+    for (const segment of segments) {
+      if (!segment.escaped && segment.value === ".") continue;
+      if (!segment.escaped && segment.value === "..") {
+        if (nodes.length > 1) nodes.pop();
+        continue;
+      }
+      const parent = nodes[nodes.length - 1];
+      if (!parent) throw new RepositoryError("invariant", "path has no root");
+      const membership = parent.memberships.find((member) =>
+        this.records.getEntryRevision(member.entryRevisionId).name === segment.value
       );
+      if (!membership) throw new RepositoryError("not_found", "path not found: " + rawPath);
+      const entry = this.records.getEntryRevision(membership.entryRevisionId);
+      nodes.push(this.resolved(
+        this.records.getNodeRevision(membership.childNodeRevisionId),
+        [...parent.entryPath, entry.entryId],
+        [...parent.names, entry.name],
+      ));
     }
 
-    const parentPathIndex = sibling
-      ? cursor.inodePath.length - 2
-      : cursor.inodePath.length - 1;
-    const requestedParent = cursor.inodePath[parentPathIndex];
-
-    if (!requestedParent) {
-      throw new RepositoryError("invariant", "root cannot have a sibling");
-    }
-
-    const parentId = this.resolveLiveInode(snapshot.id, requestedParent);
-    const parentDirectory = this.findDirectory(
-      snapshot.rootDirectoryId,
-      parentId,
-    );
-
-    if (!parentDirectory) {
-      throw new RepositoryError("not_found", "parent record is not reachable");
-    }
-
-    const child = this.createPayload(fields, null);
-    const childDirectory = this.createDirectory(child.id, [], null);
-    const rootDirectoryId = this.replaceDirectory(
-      snapshot.rootDirectoryId,
-      parentId,
-      (directory) => {
-        const entry = {
-          position: directory.entries.length,
-          directoryId: childDirectory.id,
-        };
-
-        return this.createDirectory(
-          directory.payloadId,
-          [...directory.entries, entry],
-          directory,
-        );
-      },
-    );
-
-    return {
-      nextRootDirectoryId: rootDirectoryId,
-      nextCursorPath: enter
-        ? [...cursor.inodePath, child.id]
-        : cursor.inodePath,
-      journalPayload: { child: child.id },
-    };
+    return this.required(nodes[nodes.length - 1], "path has no root node");
   }
 
-  enter(
-    snapshot: Snapshot,
-    cursor: Cursor,
-    requestedInodeId: InodeId,
-  ): ModelMutation {
-    const currentId = this.resolveLiveInode(
-      snapshot.id,
-      this.currentPathId(cursor),
-    );
-    const targetId = this.resolveLiveInode(snapshot.id, requestedInodeId);
-    const currentDirectory = this.findDirectory(
-      snapshot.rootDirectoryId,
-      currentId,
-    );
-    const isChild = currentDirectory?.entries.some((entry) => {
-      const childDirectory = this.records.getDirectory(entry.directoryId);
-      return childDirectory.payloadId === targetId;
-    });
-
-    if (!isChild) {
-      throw new RepositoryError(
-        "invariant",
-        "target is not a direct child of the cursor record",
-      );
-    }
-
-    return {
-      nextRootDirectoryId: snapshot.rootDirectoryId,
-      nextCursorPath: [...cursor.inodePath, targetId],
-      journalPayload: { target: targetId },
-    };
-  }
-
-  back(snapshot: Snapshot, cursor: Cursor): ModelMutation {
-    const nextCursorPath = cursor.inodePath.length > 1
-      ? cursor.inodePath.slice(0, -1)
-      : cursor.inodePath;
-
-    return {
-      nextRootDirectoryId: snapshot.rootDirectoryId,
-      nextCursorPath,
-      journalPayload: {},
-    };
-  }
-
-  update(
-    snapshot: Snapshot,
-    cursor: Cursor,
-    requestedInodeId: InodeId | undefined,
-    patch: Partial<PayloadFields>,
-  ): ModelMutation {
-    const targetId = this.resolveLiveInode(
-      snapshot.id,
-      requestedInodeId ?? this.currentPathId(cursor),
-    );
-    const before = this.records.getPayload(targetId);
-    const replacement = this.createPayload(
-      PayloadFieldsSchema.parse({
-        ...this.payloadFields(before),
-        ...patch,
-      }),
-      before,
-    );
-    const rootDirectoryId = this.replaceDirectory(
-      snapshot.rootDirectoryId,
-      targetId,
-      (directory) => this.createDirectory(
-        replacement.id,
-        directory.entries,
-        directory,
-      ),
-    );
-
-    return {
-      nextRootDirectoryId: rootDirectoryId,
-      nextCursorPath: this.replaceInPath(
-        cursor.inodePath,
-        targetId,
-        replacement.id,
-      ),
-      journalPayload: { replacement: replacement.id },
-    };
-  }
-
-  close(
-    snapshot: Snapshot,
-    cursor: Cursor,
-    requestedInodeId: InodeId | undefined,
-    summary: string,
-    status: "done" | "abandoned" | "superseded",
-    moveToParent: boolean,
-  ): ModelMutation {
-    const targetId = this.resolveLiveInode(
-      snapshot.id,
-      requestedInodeId ?? this.currentPathId(cursor),
-    );
-    const directory = this.findDirectory(snapshot.rootDirectoryId, targetId);
-
-    if (!directory) {
-      throw new RepositoryError("not_found", "target record is not reachable");
-    }
-
-    const hasOpenDescendant = directory.entries.some((entry) =>
-      this.payloadIds(entry.directoryId)
-        .map((inodeId) => this.records.getPayload(inodeId))
-        .some((inode) => !terminalStatuses.has(inode.status)),
-    );
-
-    if (hasOpenDescendant) {
-      throw new RepositoryError(
-        "invariant",
-        "cannot close a record with non-terminal descendants",
-      );
-    }
-
-    const before = this.records.getPayload(targetId);
-    const replacement = this.createPayload(
-      PayloadFieldsSchema.parse({
-        ...this.payloadFields(before),
-        currentState: summary,
-        status,
-      }),
-      before,
-    );
-    const rootDirectoryId = this.replaceDirectory(
-      snapshot.rootDirectoryId,
-      targetId,
-      (existingDirectory) => this.createDirectory(
-        replacement.id,
-        existingDirectory.entries,
-        existingDirectory,
-      ),
-    );
-    const replacedPath = this.replaceInPath(
-      cursor.inodePath,
-      targetId,
-      replacement.id,
-    );
-    const nextCursorPath = moveToParent &&
-      replacedPath[replacedPath.length - 1] === replacement.id &&
-      replacedPath.length > 1
-      ? replacedPath.slice(0, -1)
-      : replacedPath;
-
-    return {
-      nextRootDirectoryId: rootDirectoryId,
-      nextCursorPath,
-      journalPayload: { replacement: replacement.id },
-    };
-  }
-
-  forkSource(parentSessionId: string): {
-    workspaceId: InodeId;
-    headSnapshotId: InodeId;
-    cursorPath: InodeId[];
+  mkdir(resolved: ResolvedSession, name: string, patch: WorkPatch | undefined): {
+    rootNodeRevisionId: Id;
+    cursorEntryPath: Id[];
   } {
-    const parent = this.records.getSession(parentSessionId);
-    const cursor = this.records.getCursor(parentSessionId);
+    const normalizedName = this.normalizeName(name);
+    const parent = this.current(resolved);
+    this.ensureNameAvailable(parent.memberships, normalizedName);
+    const child = this.createNode(this.mergeWork(this.emptyWork(), patch));
+    const entryId = this.records.createEntry(child.nodeId);
+    const entry = this.records.insertEntryRevision(entryId, null, normalizedName);
+    const rootNodeRevisionId = this.rewriteDirectories(
+      resolved.snapshot.rootNodeRevisionId,
+      new Map([[this.pathKey(parent.entryPath), {
+        remove: new Set<Id>(),
+        add: [{
+          position: parent.memberships.length,
+          entryRevisionId: entry.id,
+          childNodeRevisionId: child.id,
+        }],
+      }]]),
+    );
+    return { rootNodeRevisionId, cursorEntryPath: resolved.cursor.entryPath };
+  }
 
+  edit(resolved: ResolvedSession, patch: WorkPatch): {
+    rootNodeRevisionId: Id;
+    cursorEntryPath: Id[];
+  } {
+    const current = this.current(resolved);
+    const nextPayload = this.records.insertPayloadRevision(
+      current.nodeRevision.nodeId,
+      current.payload,
+      this.mergeWork(this.work(current.payload), patch),
+    );
+    const replacement = this.records.insertNodeRevision(
+      current.nodeRevision.nodeId,
+      current.nodeRevision,
+      nextPayload.id,
+      current.directory.id,
+    );
     return {
-      workspaceId: parent.workspaceId,
-      headSnapshotId: parent.headSnapshotId,
-      cursorPath: cursor.inodePath,
+      rootNodeRevisionId: this.replaceNodeAtPath(
+        resolved.snapshot.rootNodeRevisionId,
+        current.entryPath,
+        replacement.id,
+      ),
+      cursorEntryPath: resolved.cursor.entryPath,
     };
   }
 
-  createProposal(
-    session: SessionState,
-    cursor: Cursor,
-    kind: Proposal["kind"],
-    requestedInodeId: InodeId | undefined,
-    patch: Partial<PayloadFields> | undefined,
-    candidateInodeId: InodeId | undefined,
-    sourceSessionId: string | undefined,
-    sourceSnapshotId: InodeId | undefined,
-  ): Omit<Proposal, "id"> {
-    const sourceId = sourceSnapshotId ?? session.headSnapshotId;
-    const targetId = this.resolveLiveInode(
-      sourceId,
-      requestedInodeId ?? this.currentPathId(cursor),
-    );
-    const base = this.records.getPayload(targetId);
-    const candidateId = candidateInodeId ?? (
-      patch
-        ? this.createPayload(
-          PayloadFieldsSchema.parse({
-            ...this.payloadFields(base),
-            ...patch,
-          }),
-          base,
-        ).id
-        : null
-    );
-
+  cd(resolved: ResolvedSession, path: string): {
+    rootNodeRevisionId: Id;
+    cursorEntryPath: Id[];
+  } {
+    const target = this.resolvePath(resolved, path);
     return {
-      sessionId: session.id,
+      rootNodeRevisionId: resolved.snapshot.rootNodeRevisionId,
+      cursorEntryPath: target.entryPath,
+    };
+  }
+
+  close(resolved: ResolvedSession, summary: string, status: "done" | "abandoned" | "superseded"): {
+    rootNodeRevisionId: Id;
+    cursorEntryPath: Id[];
+  } {
+    const current = this.current(resolved);
+    if (this.hasOpenDescendant(current.nodeRevision.id)) {
+      throw new RepositoryError("invariant", "cannot close a node with non-terminal descendants");
+    }
+    const nextPayload = this.records.insertPayloadRevision(
+      current.nodeRevision.nodeId,
+      current.payload,
+      this.mergeWork(this.work(current.payload), { currentState: summary, status }),
+    );
+    const replacement = this.records.insertNodeRevision(
+      current.nodeRevision.nodeId,
+      current.nodeRevision,
+      nextPayload.id,
+      current.directory.id,
+    );
+    return {
+      rootNodeRevisionId: this.replaceNodeAtPath(
+        resolved.snapshot.rootNodeRevisionId,
+        current.entryPath,
+        replacement.id,
+      ),
+      cursorEntryPath: current.entryPath.length > 0
+        ? current.entryPath.slice(0, -1)
+        : current.entryPath,
+    };
+  }
+
+  move(resolved: ResolvedSession, sourcePath: string, destinationPath: string): {
+    rootNodeRevisionId: Id;
+    cursorEntryPath: Id[];
+  } {
+    const source = this.resolvePath(resolved, sourcePath);
+    if (source.entryPath.length === 0) {
+      throw new RepositoryError("invariant", "cannot move the root node");
+    }
+    const sourceParentPath = source.entryPath.slice(0, -1);
+    const sourceEntryId = this.required(source.entryPath[source.entryPath.length - 1], "source entry is missing");
+    const sourceParent = this.resolveEntryPath(resolved, sourceParentPath);
+    const sourceMembership = sourceParent.memberships.find((membership) =>
+      this.records.getEntryRevision(membership.entryRevisionId).entryId === sourceEntryId
+    );
+    if (!sourceMembership) throw new RepositoryError("invariant", "source membership not found");
+    const sourceEntry = this.records.getEntryRevision(sourceMembership.entryRevisionId);
+
+    const destination = this.resolveMoveDestination(resolved, destinationPath, sourceEntry.name);
+    if (this.startsWith(destination.parent.entryPath, source.entryPath)) {
+      throw new RepositoryError("invariant", "cannot move a node into itself or its descendant");
+    }
+    const sameParent = this.pathKey(sourceParentPath) === this.pathKey(destination.parent.entryPath);
+    const existing = destination.parent.memberships.filter((membership) =>
+      this.records.getEntryRevision(membership.entryRevisionId).entryId !== sourceEntryId
+    );
+    this.ensureNameAvailable(existing, destination.name);
+
+    const entryRevision = destination.name === sourceEntry.name
+      ? sourceEntry
+      : this.records.insertEntryRevision(sourceEntry.entryId, sourceEntry, destination.name);
+    const edits = new Map<string, DirectoryEdit>();
+    this.addDirectoryEdit(edits, sourceParentPath, { remove: new Set([sourceEntryId]), add: [] });
+    this.addDirectoryEdit(edits, destination.parent.entryPath, {
+      remove: sameParent ? new Set<Id>() : new Set<Id>(),
+      add: [{
+        position: destination.parent.memberships.length,
+        entryRevisionId: entryRevision.id,
+        childNodeRevisionId: sourceMembership.childNodeRevisionId,
+      }],
+    });
+
+    const rootNodeRevisionId = this.rewriteDirectories(
+      resolved.snapshot.rootNodeRevisionId,
+      edits,
+    );
+    const cursorEntryPath = this.repairMovedCursor(
+      resolved.cursor.entryPath,
+      source.entryPath,
+      [...destination.parent.entryPath, sourceEntryId],
+    );
+    return { rootNodeRevisionId, cursorEntryPath };
+  }
+
+  fork(resolved: ResolvedSession, newSessionId: string): ResolvedSession {
+    if (this.records.findSession(newSessionId)) {
+      return this.resolveSession(newSessionId);
+    }
+    const session: Session = {
+      id: newSessionId,
+      workspaceId: resolved.session.workspaceId,
+      headSnapshotId: resolved.snapshot.id,
+      parentSessionId: resolved.session.id,
+      createdAt: this.timestamp(),
+    };
+    const cursor: Cursor = {
+      sessionId: newSessionId,
+      snapshotId: resolved.snapshot.id,
+      entryPath: resolved.cursor.entryPath,
+      updatedAt: this.timestamp(),
+    };
+    this.records.insertSession(session);
+    this.records.saveCursor(cursor);
+    return this.resolveSession(newSessionId);
+  }
+
+  createProposal(resolved: ResolvedSession, kind: ProposalKind, patch: WorkPatch | undefined, sourceSessionId?: string): Proposal {
+    const current = this.current(resolved);
+    return this.records.insertProposal({
+      sessionId: resolved.session.id,
       sourceSessionId: sourceSessionId ?? null,
-      sourceSnapshotId: sourceId,
-      targetInodeId: targetId,
-      candidateInodeId: candidateId,
+      sourceSnapshotId: resolved.snapshot.id,
+      targetNodeId: current.nodeRevision.nodeId,
+      targetNodeRevisionId: current.nodeRevision.id,
       patch: patch ?? null,
       kind,
       status: "pending",
       createdAt: this.timestamp(),
       decidedAt: null,
-    };
+    });
   }
 
   decideProposal(
-    snapshot: Snapshot,
-    cursor: Cursor,
+    resolved: ResolvedSession,
     proposal: Proposal,
-    decision: "accept_existing" | "accept_replacement" | "reject" | "discard",
-    candidateInodeId: InodeId | undefined,
-    replacementPatch: Partial<PayloadFields> | undefined,
-  ): ProposalDecision {
+    decision: ProposalDecision,
+    replacement: WorkPatch | undefined,
+  ): {
+    rootNodeRevisionId: Id | undefined;
+    cursorEntryPath: Id[];
+    status: "applied" | "rejected" | "discarded";
+  } {
     if (decision === "reject" || decision === "discard") {
       return {
-        mutation: undefined,
-        proposalStatus: decision === "reject" ? "rejected" : "discarded",
+        rootNodeRevisionId: undefined,
+        cursorEntryPath: resolved.cursor.entryPath,
+        status: decision === "reject" ? "rejected" : "discarded",
       };
     }
-
-    const targetId = this.resolveLiveInode(snapshot.id, proposal.targetInodeId);
-    const current = this.records.getPayload(targetId);
-    const chosen = decision === "accept_existing"
-      ? this.selectCandidate(candidateInodeId ?? proposal.candidateInodeId)
-      : this.createPayload(
-        PayloadFieldsSchema.parse({
-          ...this.payloadFields(current),
-          ...replacementPatch,
-        }),
-        current,
-      );
-    const rootDirectoryId = this.replaceDirectory(
-      snapshot.rootDirectoryId,
-      targetId,
-      (directory) => this.createDirectory(chosen.id, directory.entries, directory),
-    );
-
-    return {
-      mutation: {
-        nextRootDirectoryId: rootDirectoryId,
-        nextCursorPath: this.replaceInPath(
-          cursor.inodePath,
-          targetId,
-          chosen.id,
-        ),
-        journalPayload: {
-          proposalId: proposal.id,
-          chosen: chosen.id,
-        },
-      },
-      proposalStatus: "applied",
-    };
-  }
-
-  search(
-    sessionId: string,
-    query: string,
-    scope: "active_path" | "session_tree" | "workspace" | "global" | "history",
-  ): PayloadInode[] {
-    const context = this.context(sessionId);
-    const normalizedQuery = query.toLowerCase();
-    const contains = (inode: PayloadInode): boolean => {
-      const searchableText = [
-        inode.title,
-        inode.objective,
-        inode.rationale,
-        inode.currentState,
-        ...inode.openQuestions,
-        inode.returnCondition,
-        JSON.stringify(inode.refs),
-        JSON.stringify(inode.metadata),
-      ].join("\n").toLowerCase();
-
-      return searchableText.includes(normalizedQuery);
-    };
-
-    if (scope === "active_path") {
-      return context.activePath.filter(contains);
+    if (proposal.sourceSnapshotId !== resolved.snapshot.id) {
+      throw new RepositoryError("conflict", "proposal is stale against the current session head");
     }
-
-    const ids = this.searchIds(sessionId, context, scope);
-
-    return ids
-      .map((inodeId) => this.records.getPayload(inodeId))
-      .filter(contains)
-      .slice(0, 20);
-  }
-
-  createSnapshot(
-    rootDirectoryId: InodeId,
-    parentSnapshotId: InodeId | null,
-  ): Snapshot {
-    return this.records.insertSnapshot({
-      rootDirectoryId,
-      parentSnapshotId,
-      createdAt: this.timestamp(),
-    });
-  }
-
-  cursorFor(
-    sessionId: string,
-    snapshotId: InodeId,
-    inodePath: InodeId[],
-  ): Cursor {
-    return CursorSchema.parse({
-      sessionId,
-      snapshotId,
-      inodePath,
-      updatedAt: this.timestamp(),
-    });
-  }
-
-  private searchIds(
-    sessionId: string,
-    context: Context,
-    scope: "session_tree" | "workspace" | "global" | "history",
-  ): InodeId[] {
-    if (scope === "session_tree") {
-      const snapshot = this.records.getSnapshot(context.headSnapshotId);
-      return this.payloadIds(snapshot.rootDirectoryId);
+    const current = this.current(resolved);
+    if (current.nodeRevision.id !== proposal.targetNodeRevisionId) {
+      throw new RepositoryError("conflict", "proposal target is no longer the current node");
     }
+    const patch = decision === "accept" ? proposal.patch : replacement;
+    if (!patch) throw new RepositoryError("invariant", "proposal decision requires a patch");
+    const mutation = this.edit(resolved, patch);
+    return { ...mutation, status: "applied" };
+  }
 
-    if (scope === "history") {
-      return this.records.listAllPayloadIds();
+  listNodeRevisions(node: ResolvedNode): NodeRevision[] {
+    const output: NodeRevision[] = [];
+    let revision: NodeRevision | null = node.nodeRevision;
+    while (revision) {
+      output.push(revision);
+      revision = revision.predecessorId
+        ? this.records.getNodeRevision(revision.predecessorId)
+        : null;
     }
-
-    const session = this.records.getSession(sessionId);
-    const snapshotIds = scope === "workspace"
-      ? this.records.listSessionHeadSnapshotIds(session.workspaceId)
-      : this.records.listSessionHeadSnapshotIds();
-    const ids = snapshotIds.flatMap((snapshotId) => {
-      const snapshot = this.records.getSnapshot(snapshotId);
-      return this.payloadIds(snapshot.rootDirectoryId);
-    });
-
-    return [...new Set(ids)];
-  }
-
-  private createPayload(
-    fields: PayloadFields,
-    predecessor: PayloadInode | null,
-  ): PayloadInode {
-    return this.records.insertPayload({
-      ...fields,
-      predecessorId: predecessor?.id ?? null,
-      historyVersion: predecessor ? predecessor.historyVersion + 1 : 0,
-      createdAt: this.timestamp(),
-    });
-  }
-
-  private createDirectory(
-    payloadId: InodeId,
-    entries: DirectoryInode["entries"],
-    predecessor: DirectoryInode | null,
-  ): DirectoryInode {
-    return this.records.insertDirectory({
-      predecessorId: predecessor?.id ?? null,
-      historyVersion: predecessor ? predecessor.historyVersion + 1 : 0,
-      payloadId,
-      entries,
-      createdAt: this.timestamp(),
-    });
-  }
-
-  private payloadIds(
-    directoryId: InodeId,
-    output: InodeId[] = [],
-  ): InodeId[] {
-    const directory = this.records.getDirectory(directoryId);
-    output.push(directory.payloadId);
-
-    for (const entry of directory.entries) {
-      this.payloadIds(entry.directoryId, output);
-    }
-
     return output;
   }
 
-  private findDirectory(
-    directoryId: InodeId,
-    payloadId: InodeId,
-  ): DirectoryInode | undefined {
-    const directory = this.records.getDirectory(directoryId);
-
-    if (directory.payloadId === payloadId) {
-      return directory;
+  revisionOnLineage(node: ResolvedNode, revisionId: Id): NodeRevision {
+    const found = this.listNodeRevisions(node).find((revision) =>
+      revision.id === revisionId
+    );
+    if (!found || found.nodeId !== node.nodeRevision.nodeId) {
+      throw new RepositoryError("not_found", "revision is not on the current node lineage");
     }
-
-    for (const entry of directory.entries) {
-      const found = this.findDirectory(entry.directoryId, payloadId);
-
-      if (found) {
-        return found;
-      }
-    }
-
-    return undefined;
+    return found;
   }
 
-  private replaceDirectory(
-    rootDirectoryId: InodeId,
-    targetPayloadId: InodeId,
-    apply: (directory: DirectoryInode) => DirectoryInode,
-  ): InodeId {
-    const walk = (directoryId: InodeId): {
-      directoryId: InodeId;
-      changed: boolean;
-    } => {
-      const directory = this.records.getDirectory(directoryId);
+  countUnresolved(resolved: ResolvedSession): number {
+    return this.walk(resolved.snapshot.rootNodeRevisionId).filter((node) =>
+      !terminal.has(node.payload.status)
+    ).length;
+  }
 
-      if (directory.payloadId === targetPayloadId) {
-        return {
-          directoryId: apply(directory).id,
-          changed: true,
-        };
-      }
+  allNodes(resolved: ResolvedSession): ResolvedNode[] {
+    return this.walk(resolved.snapshot.rootNodeRevisionId);
+  }
 
-      let changed = false;
-      const entries = directory.entries.map((entry) => {
-        const result = walk(entry.directoryId);
-        changed ||= result.changed;
+  allNodesAt(rootNodeRevisionId: Id): ResolvedNode[] {
+    return this.walk(rootNodeRevisionId);
+  }
 
-        return result.changed
-          ? { ...entry, directoryId: result.directoryId }
-          : entry;
-      });
+  allNodesBelow(node: ResolvedNode): ResolvedNode[] {
+    return this.walk(node.nodeRevision.id, node.entryPath, node.names);
+  }
 
-      if (!changed) {
-        return {
-          directoryId: directory.id,
-          changed: false,
-        };
-      }
+  public work(payload: PayloadRevision): WorkFields {
+    return WorkFieldsSchema.parse({
+      kind: payload.kind,
+      title: payload.title,
+      objective: payload.objective,
+      rationale: payload.rationale,
+      currentState: payload.currentState,
+      openQuestions: payload.openQuestions,
+      returnCondition: payload.returnCondition,
+      refs: payload.refs,
+      metadata: payload.metadata,
+      status: payload.status,
+    });
+  }
 
+  public current(resolved: ResolvedSession): ResolvedNode {
+    const current = resolved.nodes[resolved.nodes.length - 1];
+    if (!current) throw new RepositoryError("invariant", "session has no root node");
+    return current;
+  }
+
+  public entrySummaries(node: ResolvedNode): Array<{
+    name: string;
+    child: ResolvedNode;
+  }> {
+    return node.memberships.map((membership) => {
+      const entry = this.records.getEntryRevision(membership.entryRevisionId);
       return {
-        directoryId: this.createDirectory(directory.payloadId, entries, directory).id,
-        changed: true,
+        name: entry.name,
+        child: this.resolved(
+          this.records.getNodeRevision(membership.childNodeRevisionId),
+          [...node.entryPath, entry.entryId],
+          [...node.names, entry.name],
+        ),
       };
+    });
+  }
+
+  public path(node: ResolvedNode): string {
+    return node.names.length === 0 ? "/" : "/" + node.names.map((name) =>
+      this.escapeName(name)
+    ).join("/");
+  }
+
+  public changes(revision: NodeRevision): Array<"payload" | "directory"> {
+    if (!revision.predecessorId) return ["payload", "directory"];
+    const previous = this.records.getNodeRevision(revision.predecessorId);
+    const changes: Array<"payload" | "directory"> = [];
+    if (previous.payloadRevisionId !== revision.payloadRevisionId) changes.push("payload");
+    if (previous.directoryRevisionId !== revision.directoryRevisionId) changes.push("directory");
+    return changes;
+  }
+
+  private createNode(fields: WorkFields): NodeRevision {
+    const nodeId = this.records.createNode();
+    const payload = this.records.insertPayloadRevision(nodeId, null, fields);
+    const directory = this.records.insertDirectoryRevision(nodeId, null, []);
+    return this.records.insertNodeRevision(nodeId, null, payload.id, directory.id);
+  }
+
+  private resolved(nodeRevision: NodeRevision, entryPath: Id[], names: string[]): ResolvedNode {
+    return {
+      nodeRevision,
+      payload: this.records.getPayloadRevision(nodeRevision.payloadRevisionId),
+      directory: this.records.getDirectoryRevision(nodeRevision.directoryRevisionId),
+      memberships: this.records.listMemberships(nodeRevision.directoryRevisionId),
+      entryPath,
+      names,
     };
-    const result = walk(rootDirectoryId);
-
-    if (!result.changed) {
-      throw new RepositoryError(
-        "not_found",
-        "inode is not reachable from this root snapshot",
-      );
-    }
-
-    return result.directoryId;
   }
 
-  private resolveLiveInode(
-    snapshotId: InodeId,
-    requestedInodeId: InodeId,
-  ): InodeId {
-    const snapshot = this.records.getSnapshot(snapshotId);
-    const currentIds = this.payloadIds(snapshot.rootDirectoryId);
-
-    if (currentIds.includes(requestedInodeId)) {
-      return requestedInodeId;
+  private resolveEntryPath(resolved: ResolvedSession, path: Id[]): ResolvedNode {
+    const root = resolved.nodes[0];
+    if (!root) throw new RepositoryError("invariant", "missing root");
+    let current = root;
+    for (const entryId of path) {
+      const membership = current.memberships.find((item) =>
+        this.records.getEntryRevision(item.entryRevisionId).entryId === entryId
+      );
+      if (!membership) throw new RepositoryError("not_found", "entry path is not reachable");
+      const entry = this.records.getEntryRevision(membership.entryRevisionId);
+      current = this.resolved(
+        this.records.getNodeRevision(membership.childNodeRevisionId),
+        [...current.entryPath, entryId],
+        [...current.names, entry.name],
+      );
     }
+    return current;
+  }
 
-    const successors = currentIds.filter((inodeId) => {
-      let inode = this.records.getPayload(inodeId);
-      const seen = new Set<InodeId>();
+  private resolveMoveDestination(
+    resolved: ResolvedSession,
+    rawDestination: string,
+    sourceName: string,
+  ): { parent: ResolvedNode; name: string } {
+    try {
+      return {
+        parent: this.resolvePath(resolved, rawDestination),
+        name: sourceName,
+      };
+    } catch (error) {
+      if (!(error instanceof RepositoryError) || error.code !== "not_found") throw error;
+    }
+    const absolute = rawDestination.startsWith("/");
+    const segments = this.parsePath(rawDestination);
+    const final = segments.pop();
+    if (!final || (!final.escaped && (final.value === "." || final.value === ".."))) {
+      throw new RepositoryError("invariant", "destination must name a directory or new entry");
+    }
+    const parentPath = (absolute ? "/" : "") + segments.map((segment) =>
+      this.escapeName(segment.value)
+    ).join("/");
+    return {
+      parent: this.resolvePath(resolved, parentPath || (absolute ? "/" : ".")),
+      name: this.normalizeName(final.value),
+    };
+  }
 
-      while (inode.predecessorId && !seen.has(inode.id)) {
-        seen.add(inode.id);
-
-        if (inode.predecessorId === requestedInodeId) {
-          return true;
+  private rewriteDirectories(
+    rootNodeRevisionId: Id,
+    edits: Map<string, DirectoryEdit>,
+  ): Id {
+    const walk = (nodeRevisionId: Id, path: Id[]): Id => {
+      const node = this.records.getNodeRevision(nodeRevisionId);
+      const directory = this.records.getDirectoryRevision(node.directoryRevisionId);
+      const memberships = this.records.listMemberships(directory.id);
+      const childIds = new Set<Id>();
+      for (const editPath of edits.keys()) {
+        const parsed = this.keyPath(editPath);
+        if (parsed.length > path.length && this.startsWith(parsed.slice(0, path.length), path)) {
+          childIds.add(this.required(parsed[path.length], "path edit is missing a child entry"));
         }
-
-        inode = this.records.getPayload(inode.predecessorId);
       }
-
-      return false;
-    });
-
-    if (successors.length !== 1) {
-      throw new RepositoryError(
-        "conflict",
-        "inode has no unique successor reachable from session head",
+      let changed = false;
+      let next = memberships.map((membership) => {
+        const entry = this.records.getEntryRevision(membership.entryRevisionId);
+        if (!childIds.has(entry.entryId)) return membership;
+        const childRevisionId = walk(
+          membership.childNodeRevisionId,
+          [...path, entry.entryId],
+        );
+        if (childRevisionId === membership.childNodeRevisionId) return membership;
+        changed = true;
+        return { ...membership, childNodeRevisionId: childRevisionId };
+      });
+      const local = edits.get(this.pathKey(path));
+      if (local) {
+        changed = true;
+        next = next.filter((membership) => !local.remove.has(
+          this.records.getEntryRevision(membership.entryRevisionId).entryId,
+        ));
+        next = [...next, ...local.add];
+        this.ensureUniqueMembershipNames(next);
+      }
+      if (!changed) return nodeRevisionId;
+      const nextDirectory = this.records.insertDirectoryRevision(
+        node.nodeId,
+        directory,
+        next.map((membership, position) => ({ ...membership, position })),
       );
+      return this.records.insertNodeRevision(
+        node.nodeId,
+        node,
+        node.payloadRevisionId,
+        nextDirectory.id,
+      ).id;
+    };
+    return walk(rootNodeRevisionId, []);
+  }
+
+  private replaceNodeAtPath(rootNodeRevisionId: Id, entryPath: Id[], replacementId: Id): Id {
+    if (entryPath.length === 0) {
+      return replacementId;
     }
 
-    return successors[0];
-  }
-
-  private payloadFields(inode: PayloadInode): PayloadFields {
-    return PayloadFieldsSchema.parse({
-      kind: inode.kind,
-      title: inode.title,
-      objective: inode.objective,
-      rationale: inode.rationale,
-      currentState: inode.currentState,
-      openQuestions: inode.openQuestions,
-      returnCondition: inode.returnCondition,
-      refs: inode.refs,
-      metadata: inode.metadata,
-      status: inode.status,
-    });
-  }
-
-  private selectCandidate(candidateId: InodeId | null): PayloadInode {
-    if (candidateId === null) {
-      throw new RepositoryError(
-        "invariant",
-        "accept_existing requires a candidate inode",
-      );
-    }
-
-    return this.records.getPayload(candidateId);
-  }
-
-  private replaceInPath(
-    path: InodeId[],
-    targetId: InodeId,
-    replacementId: InodeId,
-  ): InodeId[] {
-    return path.map((inodeId) =>
-      inodeId === targetId ? replacementId : inodeId,
+    const parentPath = entryPath.slice(0, -1);
+    const targetEntryId = this.required(entryPath[entryPath.length - 1], "replacement target is missing");
+    return this.replaceChild(
+      rootNodeRevisionId,
+      parentPath,
+      targetEntryId,
+      replacementId,
     );
   }
 
-  private currentPathId(cursor: Cursor): InodeId {
-    const currentId = cursor.inodePath[cursor.inodePath.length - 1];
+  private replaceChild(
+    rootNodeRevisionId: Id,
+    parentPath: Id[],
+    entryId: Id,
+    replacementId: Id,
+  ): Id {
+    const walk = (nodeRevisionId: Id, depth: number): Id => {
+      const node = this.records.getNodeRevision(nodeRevisionId);
+      const directory = this.records.getDirectoryRevision(node.directoryRevisionId);
+      const memberships = this.records.listMemberships(directory.id);
+      let changed = false;
+      const next = memberships.map((membership) => {
+        const entry = this.records.getEntryRevision(membership.entryRevisionId);
+        if (depth === parentPath.length && entry.entryId === entryId) {
+          changed = true;
+          return { ...membership, childNodeRevisionId: replacementId };
+        }
+        if (depth < parentPath.length && entry.entryId === parentPath[depth]) {
+          const child = walk(membership.childNodeRevisionId, depth + 1);
+          if (child !== membership.childNodeRevisionId) {
+            changed = true;
+            return { ...membership, childNodeRevisionId: child };
+          }
+        }
+        return membership;
+      });
+      if (!changed) return nodeRevisionId;
+      const nextDirectory = this.records.insertDirectoryRevision(node.nodeId, directory, next);
+      return this.records.insertNodeRevision(
+        node.nodeId,
+        node,
+        node.payloadRevisionId,
+        nextDirectory.id,
+      ).id;
+    };
+    return walk(rootNodeRevisionId, 0);
+  }
 
-    if (!currentId) {
-      throw new RepositoryError("invariant", "cursor path must not be empty");
+  private hasOpenDescendant(nodeRevisionId: Id): boolean {
+    const node = this.records.getNodeRevision(nodeRevisionId);
+    const memberships = this.records.listMemberships(node.directoryRevisionId);
+    return memberships.some((membership) => {
+      const child = this.records.getNodeRevision(membership.childNodeRevisionId);
+      const payload = this.records.getPayloadRevision(child.payloadRevisionId);
+      return !terminal.has(payload.status) || this.hasOpenDescendant(child.id);
+    });
+  }
+
+  private walk(nodeRevisionId: Id, path: Id[] = [], names: string[] = []): ResolvedNode[] {
+    const current = this.resolved(this.records.getNodeRevision(nodeRevisionId), path, names);
+    return [
+      current,
+      ...current.memberships.flatMap((membership) => {
+        const entry = this.records.getEntryRevision(membership.entryRevisionId);
+        return this.walk(
+          membership.childNodeRevisionId,
+          [...path, entry.entryId],
+          [...names, entry.name],
+        );
+      }),
+    ];
+  }
+
+  private addDirectoryEdit(edits: Map<string, DirectoryEdit>, path: Id[], change: DirectoryEdit): void {
+    const key = this.pathKey(path);
+    const existing = edits.get(key);
+    if (!existing) {
+      edits.set(key, change);
+      return;
     }
+    change.remove.forEach((entryId) => existing.remove.add(entryId));
+    existing.add.push(...change.add);
+  }
 
-    return currentId;
+  private repairMovedCursor(cursor: Id[], source: Id[], destination: Id[]): Id[] {
+    if (!this.startsWith(cursor, source)) return cursor;
+    return [...destination, ...cursor.slice(source.length)];
+  }
+
+  private ensureNameAvailable(memberships: Membership[], name: string): void {
+    if (memberships.some((membership) =>
+      this.records.getEntryRevision(membership.entryRevisionId).name === name
+    )) {
+      throw new RepositoryError("conflict", "directory already contains: " + name);
+    }
+  }
+
+  private ensureUniqueMembershipNames(memberships: Membership[]): void {
+    const names = new Set<string>();
+    for (const membership of memberships) {
+      const name = this.records.getEntryRevision(membership.entryRevisionId).name;
+      if (names.has(name)) throw new RepositoryError("conflict", "directory already contains: " + name);
+      names.add(name);
+    }
+  }
+
+  private parsePath(rawPath: string): PathSegment[] {
+    const segments: PathSegment[] = [];
+    let current = "";
+    let escaped = false;
+    let hasEscape = false;
+    for (const character of rawPath) {
+      if (escaped) {
+        current += character;
+        escaped = false;
+        hasEscape = true;
+        continue;
+      }
+      if (character === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (character === "/") {
+        if (current) segments.push({ value: this.normalizeName(current), escaped: hasEscape });
+        current = "";
+        hasEscape = false;
+        continue;
+      }
+      current += character;
+    }
+    if (escaped) throw new RepositoryError("invariant", "path ends with an escape");
+    if (current) segments.push({ value: this.normalizeName(current), escaped: hasEscape });
+    return segments;
+  }
+
+  private normalizeName(value: string): string {
+    const name = value.normalize("NFC");
+    if (!name || name.includes("\0")) throw new RepositoryError("invariant", "entry name must be non-empty and contain no NUL");
+    return name;
+  }
+
+  private escapeName(name: string): string {
+    const escaped = name.replaceAll("\\", "\\\\").replaceAll("/", "\\/");
+    return escaped === "." || escaped === ".." ? "\\" + escaped : escaped;
+  }
+
+  private pathKey(path: Id[]): string {
+    return path.join(",");
+  }
+
+  private keyPath(key: string): Id[] {
+    return key ? key.split(",").map((value) => IdSchema.parse(Number(value))) : [];
+  }
+
+  private startsWith(value: Id[], prefix: Id[]): boolean {
+    return prefix.every((entry, index) => value[index] === entry);
+  }
+
+  private mergeWork(base: WorkFields, patch: WorkPatch | undefined): WorkFields {
+    return WorkFieldsSchema.parse({ ...base, ...patch });
+  }
+
+  private emptyWork(): WorkFields {
+    return WorkFieldsSchema.parse({});
   }
 
   private timestamp(): string {
     return new Date().toISOString();
+  }
+
+  private canonicalWorkspacePath(cwd: string): string {
+    const absolutePath = resolve(cwd);
+    return platform() === "win32" ? absolutePath.toLowerCase() : absolutePath;
+  }
+
+  private required<T>(value: T | undefined, message: string): T {
+    if (value === undefined) throw new RepositoryError("invariant", message);
+    return value;
   }
 }

@@ -2,8 +2,8 @@
 
 Date: 2026-09-13
 
-Status: design direction agreed in discussion. This is not yet an implementation
-plan for the public-protocol rewrite or for a user interface.
+Status: implemented as the Context Tree v3 public protocol. This note remains
+the user-facing semantic rationale for the filesystem interface.
 
 ## Intent
 
@@ -29,15 +29,10 @@ Normal MCP results should contain compact current-relative state:
       path:
       can_go_back:
 
-    current_work:
-      kind:
-      title:
-      objective:
-      rationale:
-      state:
-      return_condition:
-      open_questions:
-      status:
+Only `pwd` includes the active `current_work` payload. Other operations retain
+`current_dir` as their orientation context and return only their focused data:
+for example, `ls` entries, search matches, a revision, or a briefing. This
+avoids repeating a full work payload after every ordinary mutation.
 
 Snapshot IDs, inode IDs, predecessor links, history versions, raw active-path
 copies, whole unresolved-record lists, and duplicated ancestor briefings remain
@@ -69,9 +64,9 @@ The core public operations should follow shell semantics:
 - fork: create an independent session checkout;
 - briefing: request the richer recovery-oriented ancestor projection.
 
-Every mutation should return a compact pwd-style summary plus any small,
-operation-specific result. This keeps the caller oriented without returning
-the entire tree.
+Every mutation should return `current_dir` plus any small operation-specific
+result. Call `pwd` when the current work payload is needed. This keeps the
+caller oriented without returning either the whole tree or a duplicate payload.
 
 The exact child-selection mechanism is still open. Candidates are an explicit
 unique directory name, a path component, or an opaque entry token returned by
@@ -159,8 +154,8 @@ of returning a whole state projection each time:
 - Navigation and focused retrieval are supplied by the filesystem operations
   above, rather than by returning a whole state projection after every action.
 
-Mutations such as create child, update, close, and proposal decision should
-return the same compact current-relative projection.
+Mutations such as create child, update, close, and proposal decision return
+the current directory projection. `pwd` is the focused payload read.
 
 ## Architecture boundary
 

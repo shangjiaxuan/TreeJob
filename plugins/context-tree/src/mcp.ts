@@ -14,13 +14,13 @@ import { OperationSchemas } from "./schema.js";
 const server = new Server(
   {
     name: "context-tree",
-    version: "1.0.0",
+    version: "3.0.0",
   },
   {
     capabilities: { tools: {} },
     instructions: [
       "Context Tree stores explicit continuation state.",
-      "Read getContext before broad searches.",
+      "Read pwd or briefing before broad searches.",
       "Decide pending compact proposals before mutating the tree.",
     ].join(" "),
   },

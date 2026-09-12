@@ -5,15 +5,9 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import {
-  renderAncestorBriefing,
-  renderMinimalPath,
-} from "./briefing.js";
+import { renderAncestorBriefing, renderMinimalPath } from "./briefing.js";
 import { call, dataDir } from "./rpc.js";
-import {
-  PayloadPatchSchema,
-  type PayloadFields,
-} from "./schema.js";
+import { WorkPatchSchema } from "./schema.js";
 
 const HookEventSchema = z.object({
   hook_event_name: z.string().optional(),
@@ -22,7 +16,6 @@ const HookEventSchema = z.object({
   cwd: z.string().optional(),
   source: z.string().optional(),
   transcript_path: z.string().optional(),
-  model: z.string().optional(),
   last_assistant_message: z.string().optional(),
 }).passthrough();
 
@@ -35,275 +28,117 @@ const journal = openHookJournal();
 try {
   await handleEvent(event, journal);
 } catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  writeOutput(undefined, "Context Tree hook degraded: " + message);
+  writeOutput(undefined, "Context Tree hook degraded: " + message(error));
 }
 
-async function handleEvent(event: HookEvent, journal: HookJournal): Promise<void> {
-  switch (event.hook_event_name) {
-    case "SessionStart":
-      await handleSessionStart(event);
-      return;
-    case "SubagentStart":
-      await handleSubagentStart(event);
-      return;
-    case "SubagentStop":
-      await handleSubagentStop(event);
-      return;
-    case "PreCompact":
-      await handlePreCompact(event, journal);
-      return;
-    case "Stop":
-      await handleStop(event);
-      return;
-    default:
-      return;
+async function handleEvent(value: HookEvent, hookJournal: HookJournal): Promise<void> {
+  switch (value.hook_event_name) {
+    case "SessionStart": return sessionStart(value);
+    case "SubagentStart": return subagentStart(value);
+    case "SubagentStop": return subagentStop(value);
+    case "PreCompact": return preCompact(value, hookJournal);
+    case "Stop": return stop(value);
+    default: return;
   }
 }
 
-async function handleSessionStart(event: HookEvent): Promise<void> {
-  const context = await call("registerSession", {
-    sessionId: sessionId(event),
-    cwd: event.cwd ?? process.cwd(),
-    commandId: eventKey(event, "SessionStart"),
-  });
-
-  writeOutput(contextRestoreBrief(context));
+async function sessionStart(value: HookEvent): Promise<void> {
+  const id = sessionId(value);
+  await call("pwd", { sessionId: id, cwd: value.cwd ?? process.cwd() }, 8_000, eventKey(value, "SessionStart"));
+  const briefing = await call("briefing", { sessionId: id });
+  writeOutput(renderMinimalPath(briefing) + "\n\n" + renderAncestorBriefing(briefing));
 }
 
-async function handleSubagentStart(event: HookEvent): Promise<void> {
-  const parentSessionId = sessionId(event);
-  const context = await call("forkSession", {
-    sessionId: subagentSessionId(event),
-    parentSessionId,
-    commandId: eventKey(event, "SubagentStart"),
-  });
-
-  writeOutput(contextRestoreBrief(context));
+async function subagentStart(value: HookEvent): Promise<void> {
+  const parent = sessionId(value);
+  const child = subagentSessionId(value);
+  await call("fork", { sessionId: parent, newSessionId: child }, 8_000, eventKey(value, "SubagentStart"));
+  const briefing = await call("briefing", { sessionId: child });
+  writeOutput(renderMinimalPath(briefing) + "\n\n" + renderAncestorBriefing(briefing));
 }
 
-async function handleSubagentStop(event: HookEvent): Promise<void> {
-  const parentSessionId = sessionId(event);
-
-  await call("createProposal", {
-    sessionId: parentSessionId,
+async function subagentStop(value: HookEvent): Promise<void> {
+  await call("submit-proposal", {
+    sessionId: sessionId(value),
     kind: "subagent_result",
-    patch: {
-      currentState: event.last_assistant_message ??
-        "Subagent completed; inspect its branch.",
-    },
-    sourceSessionId: subagentSessionId(event),
-    commandId: eventKey(event, "SubagentStop"),
-  });
-
-  writeOutput(
-    undefined,
-    "Context Tree saved an idempotent subagent proposal.",
-  );
+    sourceSessionId: subagentSessionId(value),
+    patch: { currentState: value.last_assistant_message ?? "Subagent completed; inspect its frozen branch." },
+  }, 8_000, eventKey(value, "SubagentStop"));
+  writeOutput(undefined, "Context Tree saved a subagent proposal.");
 }
 
-async function handlePreCompact(
-  event: HookEvent,
-  journal: HookJournal,
-): Promise<void> {
-  const currentSessionId = sessionId(event);
-  const context = await call("getContext", { sessionId: currentSessionId });
-  const transcript = readTranscriptDelta(event.transcript_path);
-  const candidate = summarizeCompact(context.current, transcript.delta);
-
+async function preCompact(value: HookEvent, hookJournal: HookJournal): Promise<void> {
+  const id = sessionId(value);
+  const state = await call("pwd", { sessionId: id });
+  const transcript = readTranscriptDelta(value.transcript_path);
+  const candidate = summarizeCompact(state.current_work, transcript.delta);
   if (candidate.success) {
-    await call("createProposal", {
-      sessionId: currentSessionId,
+    await call("submit-proposal", {
+      sessionId: id,
       kind: "compact",
       patch: candidate.data,
-      commandId: eventKey(event, "PreCompact"),
-    });
+    }, 120_000, eventKey(value, "PreCompact"));
   }
-
-  recordCompactAttempt(
-    journal,
-    event,
-    transcript.path,
-    transcript.size,
-    transcript.delta,
-    candidate.success ? "" : "compact worker unavailable",
-  );
+  recordCompactAttempt(hookJournal, value, transcript.path, transcript.size, transcript.delta, candidate.success ? "" : "compact worker unavailable");
 }
 
-async function handleStop(event: HookEvent): Promise<void> {
-  const context = await call("getContext", { sessionId: sessionId(event) });
-
-  if (context.unresolved.length > 0) {
-    writeOutput(
-      undefined,
-      "Context Tree: " + context.unresolved.length +
-        " record(s) remain open or blocked.",
-    );
+async function stop(value: HookEvent): Promise<void> {
+  const briefing = await call("briefing", { sessionId: sessionId(value) });
+  if (briefing.unresolvedCount > 0) {
+    writeOutput(undefined, "Context Tree: " + briefing.unresolvedCount + " node(s) remain open or blocked.");
   }
 }
 
-function summarizeCompact(
-  current: PayloadFields,
-  delta: string,
-) {
+function summarizeCompact(current: unknown, delta: string) {
   const prompt = [
-    "Return a conservative JSON scalar update for the current continuation record.",
+    "Return a conservative JSON patch for the current continuation node.",
     "Never create nodes, move a cursor, close work, or fork.",
-    "CONTEXT:",
-    JSON.stringify(current),
-    "DELTA:",
-    delta,
+    "CURRENT WORK:", JSON.stringify(current), "TRANSCRIPT DELTA:", delta,
   ].join("\n");
-  const result = spawnSync(
-    process.env.CONTEXT_TREE_CODEX_BIN ?? "codex",
-    [
-      "exec",
-      "--ephemeral",
-      "--disable",
-      "hooks",
-      "--sandbox",
-      "read-only",
-      "--output-schema",
-      fileURLToPath(new URL("./compact-schema.json", import.meta.url)),
-      "-",
-    ],
-    {
-      input: prompt,
-      encoding: "utf8",
-      timeout: 120_000,
-    },
-  );
-
-  return PayloadPatchSchema.safeParse(parseJson(result.stdout));
+  const result = spawnSync(process.env.CONTEXT_TREE_CODEX_BIN ?? "codex", [
+    "exec", "--ephemeral", "--disable", "hooks", "--sandbox", "read-only",
+    "--output-schema", fileURLToPath(new URL("./compact-schema.json", import.meta.url)), "-",
+  ], { input: prompt, encoding: "utf8", timeout: 120_000 });
+  return WorkPatchSchema.safeParse(parseJson(result.stdout));
 }
 
-function readTranscriptDelta(transcriptPath: string | undefined): {
-  path: string;
-  size: number;
-  delta: string;
-} {
-  if (!transcriptPath || !existsSync(transcriptPath)) {
-    return {
-      path: transcriptPath ?? "",
-      size: 0,
-      delta: "",
-    };
-  }
-
+function readTranscriptDelta(transcriptPath: string | undefined): { path: string; size: number; delta: string } {
+  if (!transcriptPath || !existsSync(transcriptPath)) return { path: transcriptPath ?? "", size: 0, delta: "" };
   const size = statSync(transcriptPath).size;
-  const start = Math.max(0, size - 49_152);
-  const delta = readFileSync(transcriptPath)
-    .subarray(start)
-    .toString();
-
-  return {
-    path: transcriptPath,
-    size,
-    delta,
-  };
+  return { path: transcriptPath, size, delta: readFileSync(transcriptPath).subarray(Math.max(0, size - 49_152)).toString() };
 }
 
 function openHookJournal(): HookJournal {
   const directory = join(dataDir(), "journal");
   mkdirSync(directory, { recursive: true });
-
-  const journal = new DatabaseSync(join(directory, "hook-journal.sqlite"));
-  journal.exec(
-    "CREATE TABLE IF NOT EXISTS hook_receipts_v1(" +
-      "key TEXT PRIMARY KEY, " +
-      "transcript_path TEXT, " +
-      "byte_offset INTEGER, " +
-      "fingerprint TEXT, " +
-      "diagnostic TEXT, " +
-      "created_at TEXT NOT NULL" +
-      ")",
-  );
-
-  return journal;
+  const output = new DatabaseSync(join(directory, "hook-journal.sqlite"));
+  output.exec("CREATE TABLE IF NOT EXISTS hook_receipts_v1(key TEXT PRIMARY KEY, transcript_path TEXT, byte_offset INTEGER, fingerprint TEXT, diagnostic TEXT, created_at TEXT NOT NULL)");
+  return output;
 }
 
-function recordCompactAttempt(
-  journal: HookJournal,
-  event: HookEvent,
-  transcriptPath: string,
-  byteOffset: number,
-  delta: string,
-  diagnostic: string,
-): void {
-  journal.prepare(
-    "INSERT OR REPLACE INTO hook_receipts_v1 VALUES(?,?,?,?,?,?)",
-  ).run(
-    eventKey(event, "PreCompact"),
-    transcriptPath,
-    byteOffset,
-    createHash("sha256").update(delta).digest("hex"),
-    diagnostic,
-    new Date().toISOString(),
-  );
+function recordCompactAttempt(journal: HookJournal, value: HookEvent, path: string, offset: number, delta: string, diagnostic: string): void {
+  journal.prepare("INSERT OR REPLACE INTO hook_receipts_v1 VALUES(?,?,?,?,?,?)").run(eventKey(value, "PreCompact"), path, offset, createHash("sha256").update(delta).digest("hex"), diagnostic, new Date().toISOString());
 }
 
-function sessionId(event: HookEvent): string {
-  return event.session_id ?? "";
-}
-
-function subagentSessionId(event: HookEvent): string {
-  const parent = sessionId(event);
-  return event.agent_id ? parent + ":agent:" + event.agent_id : parent;
-}
-
-function eventKey(event: HookEvent, kind: string): string {
-  return createHash("sha256").update([
-    kind,
-    subagentSessionId(event),
-    event.transcript_path ?? "",
-    event.last_assistant_message ?? "",
-  ].join("|")).digest("hex");
-}
-
-function contextRestoreBrief(
-  context: Awaited<ReturnType<typeof call<"getContext">>>,
-): string {
-  return [
-    renderMinimalPath(context),
-    renderAncestorBriefing(context),
-  ].join("\n\n");
-}
+function sessionId(value: HookEvent): string { return value.session_id ?? ""; }
+function subagentSessionId(value: HookEvent): string { return value.agent_id ? sessionId(value) + ":agent:" + value.agent_id : sessionId(value); }
+function eventKey(value: HookEvent, kind: string): string { return createHash("sha256").update([kind, subagentSessionId(value), value.transcript_path ?? "", value.last_assistant_message ?? ""].join("|")).digest("hex"); }
 
 function writeOutput(context?: string, systemMessage?: string): void {
-  const output = {
+  console.log(JSON.stringify({
     ...(systemMessage ? { systemMessage } : {}),
-    ...(context
-      ? {
-        hookSpecificOutput: {
-          hookEventName: event.hook_event_name,
-          additionalContext: context,
-        },
-      }
-      : {}),
-  };
-
-  console.log(JSON.stringify(output));
+    ...(context ? { hookSpecificOutput: { hookEventName: event.hook_event_name, additionalContext: context } } : {}),
+  }));
 }
 
 async function readStdinJson(): Promise<unknown> {
   const text = await new Promise<string>((resolve) => {
     let value = "";
-
-    process.stdin.on("data", (chunk) => {
-      value += chunk;
-    });
-    process.stdin.on("end", () => {
-      resolve(value);
-    });
+    process.stdin.on("data", (chunk) => { value += chunk; });
+    process.stdin.on("end", () => resolve(value));
   });
-
   return parseJson(text) ?? {};
 }
 
-function parseJson(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-}
+function parseJson(text: string): unknown { try { return JSON.parse(text); } catch { return undefined; } }
+function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }

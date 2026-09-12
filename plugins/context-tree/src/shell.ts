@@ -1,18 +1,12 @@
+import { randomUUID } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
-import {
-  renderAncestorBriefing,
-  renderMinimalPath,
-} from "./briefing.js";
 import { mcpTools } from "./mcp-tools.js";
 import { callRaw } from "./rpc.js";
-import {
-  ContextSchema,
-  OperationNameSchema,
-} from "./schema.js";
+import { OperationNameSchema, type OperationName } from "./schema.js";
 
 type ShellOptions = {
   dataDir: string;
@@ -20,6 +14,7 @@ type ShellOptions = {
 
 const options = parseOptions(process.argv.slice(2));
 process.env.CONTEXT_TREE_DATA_DIR = options.dataDir;
+const defaultSessionId = "shell-" + randomUUID();
 
 const readline = createInterface({
   input: stdin,
@@ -29,6 +24,7 @@ const readline = createInterface({
 
 stdout.write("Context Tree protocol shell\n");
 stdout.write("Database: " + options.dataDir + "\n");
+stdout.write("Default session: " + defaultSessionId + "\n");
 stdout.write("Enter an operation followed by --field value parameters.\n");
 stdout.write("Use JSON directly for arrays and objects. Type help for examples.\n\n");
 
@@ -57,7 +53,7 @@ async function execute(line: string): Promise<boolean> {
   const [command, ...parameterTokens] = tokens;
 
   if (command === "help") {
-    showHelp();
+    showHelp(parameterTokens);
     return true;
   }
 
@@ -67,10 +63,26 @@ async function execute(line: string): Promise<boolean> {
 
   const method = OperationNameSchema.parse(command);
   const params = parseParameters(parameterTokens);
+  applySessionDefaults(method, params);
   const result = await callRaw(method, params);
 
   renderResult(result);
   return true;
+}
+
+function applySessionDefaults(
+  method: OperationName,
+  params: Record<string, unknown>,
+): void {
+  if (method === "hello" || method === "describe") {
+    return;
+  }
+
+  const sessionId = typeof params.sessionId === "string"
+    ? params.sessionId
+    : defaultSessionId;
+  params.sessionId = sessionId;
+
 }
 
 function parseParameters(tokens: string[]): Record<string, unknown> {
@@ -175,23 +187,34 @@ function tokenize(line: string): string[] {
 function renderResult(result: unknown): void {
   stdout.write("\nRESULT\n");
   stdout.write(JSON.stringify(result, null, 2) + "\n");
+}
 
-  const context = ContextSchema.safeParse(result);
+function showHelp(arguments_: string[]): void {
+  if (arguments_.length > 1) {
+    throw new Error("help accepts at most one command name");
+  }
 
-  if (!context.success) {
+  const requested = arguments_[0];
+
+  if (requested) {
+    const tool = mcpTools.find((candidate) => candidate.name === requested);
+
+    if (!tool) {
+      throw new Error("unknown MCP-visible command: " + requested);
+    }
+
+    stdout.write(tool.name + ": " + tool.description + "\n");
+    stdout.write(JSON.stringify(tool.inputSchema, null, 2) + "\n");
     return;
   }
 
-  stdout.write("\n" + renderMinimalPath(context.data) + "\n\n");
-  stdout.write(renderAncestorBriefing(context.data) + "\n");
-}
-
-function showHelp(): void {
   stdout.write([
     "Every non-local command is one Context Tree operation sent unchanged",
     "to the daemon. Parameter names are camelCase protocol field names.",
     "Primitive strings may be unquoted when they contain no spaces. Quote",
     "spaces. JSON arrays and objects are parsed as JSON values.",
+    "The shell supplies one generated sessionId when omitted. The daemon",
+    "initializes an unbound pwd at its workspace when cwd is omitted.",
     "",
     "MCP-visible tools and their generated input schemas:",
   ].join("\n") + "\n\n");
@@ -201,7 +224,7 @@ function showHelp(): void {
     stdout.write(JSON.stringify(tool.inputSchema, null, 2) + "\n\n");
   }
 
-  stdout.write("Local shell utilities: help, quit, exit\n");
+  stdout.write("Local shell utilities: help [command], quit, exit\n");
 }
 
 function parseOptions(args: string[]): ShellOptions {

@@ -42,7 +42,7 @@ for (const [name, declaration] of declarations) {
 
 const operations = describeOperations(declarations.get("OperationContracts"));
 const metadata = {
-  version: 1,
+  version: 2,
   schemas,
   operations,
 };
@@ -72,7 +72,10 @@ function describeOperations(declaration) {
       continue;
     }
 
-    if (!ts.isIdentifier(member.name) || !ts.isTypeLiteralNode(member.type)) {
+    if (
+      (!ts.isIdentifier(member.name) && !ts.isStringLiteral(member.name)) ||
+      !ts.isTypeLiteralNode(member.type)
+    ) {
       throw new Error("operation declarations must use named type literals");
     }
 
@@ -216,7 +219,7 @@ function describeType(node) {
         .filter((member) => ts.isPropertySignature(member) && member.name)
         .map((member) => ({
           kind: "literal",
-          value: member.name.getText(sourceFile),
+          value: propertyName(member.name),
         })),
     };
   }
@@ -409,6 +412,14 @@ function literalValue(node) {
   }
 
   throw new Error("unsupported literal type");
+}
+
+function propertyName(node) {
+  if (ts.isIdentifier(node) || ts.isStringLiteral(node)) {
+    return node.text;
+  }
+
+  throw new Error("unsupported property name");
 }
 
 function isExported(node) {

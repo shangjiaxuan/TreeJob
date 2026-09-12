@@ -56,17 +56,18 @@ export async function call<N extends OperationName>(
   method: N,
   params: OperationInput<N>,
   timeout = 8_000,
+  idempotencyKey?: string,
 ): Promise<OperationOutput<N>> {
   const directory = dataDir();
   mkdirSync(directory, { recursive: true });
 
   try {
     await hello();
-    const response = await send(method, params, timeout);
+    const response = await send(method, params, timeout, idempotencyKey);
     return parseOperationOutput(method, response);
   } catch {
     await startDaemon(directory);
-    const response = await send(method, params, timeout);
+    const response = await send(method, params, timeout, idempotencyKey);
     return parseOperationOutput(method, response);
   }
 }
@@ -80,6 +81,7 @@ export async function callRaw(
   method: OperationName,
   rawParams: unknown,
   timeout = 8_000,
+  idempotencyKey?: string,
 ): Promise<unknown> {
   const params = OperationSchemas[method].input.parse(rawParams);
   const directory = dataDir();
@@ -87,11 +89,11 @@ export async function callRaw(
 
   try {
     await hello();
-    const response = await send(method, params, timeout);
+    const response = await send(method, params, timeout, idempotencyKey);
     return OperationSchemas[method].output.parse(response);
   } catch {
     await startDaemon(directory);
-    const response = await send(method, params, timeout);
+    const response = await send(method, params, timeout, idempotencyKey);
     return OperationSchemas[method].output.parse(response);
   }
 }
@@ -100,6 +102,7 @@ function send(
   method: OperationName,
   params: unknown,
   timeout: number,
+  idempotencyKey?: string,
 ): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const id = randomUUID();
@@ -119,6 +122,7 @@ function send(
       socket.write(JSON.stringify({
         protocolVersion: PROTOCOL_VERSION,
         id,
+        ...(idempotencyKey ? { idempotencyKey } : {}),
         method,
         params,
       }) + "\n");
