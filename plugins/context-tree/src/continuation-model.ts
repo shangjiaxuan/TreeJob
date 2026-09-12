@@ -43,6 +43,19 @@ export type ResolvedSession = {
   nodes: ResolvedNode[];
 };
 
+export type ProposalMutation =
+  | {
+    kind: "unchanged";
+    cursorEntryPath: Id[];
+    status: "rejected" | "discarded";
+  }
+  | {
+    kind: "snapshot";
+    rootNodeRevisionId: Id;
+    cursorEntryPath: Id[];
+    status: "applied";
+  };
+
 type DirectoryEdit = {
   remove: Set<Id>;
   add: Membership[];
@@ -133,15 +146,15 @@ export class ContinuationModel {
     return { session, snapshot, cursor, nodes };
   }
 
-  resolvePath(resolved: ResolvedSession, rawPath: string | undefined): ResolvedNode {
-    if (!rawPath || rawPath === ".") {
+  resolvePath(resolved: ResolvedSession, rawPath: string): ResolvedNode {
+    if (rawPath === ".") {
       return this.current(resolved);
     }
 
     const absolute = rawPath.startsWith("/");
     const segments = this.parsePath(rawPath);
     let nodes = absolute
-      ? [this.required(resolved.nodes[0], "session has no root node")]
+      ? [this.valueAt(resolved.nodes, 0, "session has no root node")]
       : [...resolved.nodes];
 
     for (const segment of segments) {
@@ -164,10 +177,10 @@ export class ContinuationModel {
       ));
     }
 
-    return this.required(nodes[nodes.length - 1], "path has no root node");
+    return this.valueAt(nodes, nodes.length - 1, "path has no root node");
   }
 
-  mkdir(resolved: ResolvedSession, name: string, patch: WorkPatch | undefined): {
+  mkdir(resolved: ResolvedSession, name: string, patch: WorkPatch): {
     rootNodeRevisionId: Id;
     cursorEntryPath: Id[];
   } {
@@ -268,7 +281,11 @@ export class ContinuationModel {
       throw new RepositoryError("invariant", "cannot move the root node");
     }
     const sourceParentPath = source.entryPath.slice(0, -1);
-    const sourceEntryId = this.required(source.entryPath[source.entryPath.length - 1], "source entry is missing");
+    const sourceEntryId = this.valueAt(
+      source.entryPath,
+      source.entryPath.length - 1,
+      "source entry is missing",
+    );
     const sourceParent = this.resolveEntryPath(resolved, sourceParentPath);
     const sourceMembership = sourceParent.memberships.find((membership) =>
       this.records.getEntryRevision(membership.entryRevisionId).entryId === sourceEntryId
@@ -334,15 +351,20 @@ export class ContinuationModel {
     return this.resolveSession(newSessionId);
   }
 
-  createProposal(resolved: ResolvedSession, kind: ProposalKind, patch: WorkPatch | undefined, sourceSessionId?: string): Proposal {
+  createProposal(
+    resolved: ResolvedSession,
+    kind: ProposalKind,
+    patch: WorkPatch | null,
+    sourceSessionId: string | null,
+  ): Proposal {
     const current = this.current(resolved);
     return this.records.insertProposal({
       sessionId: resolved.session.id,
-      sourceSessionId: sourceSessionId ?? null,
+      sourceSessionId,
       sourceSnapshotId: resolved.snapshot.id,
       targetNodeId: current.nodeRevision.nodeId,
       targetNodeRevisionId: current.nodeRevision.id,
-      patch: patch ?? null,
+      patch,
       kind,
       status: "pending",
       createdAt: this.timestamp(),
@@ -354,15 +376,11 @@ export class ContinuationModel {
     resolved: ResolvedSession,
     proposal: Proposal,
     decision: ProposalDecision,
-    replacement: WorkPatch | undefined,
-  ): {
-    rootNodeRevisionId: Id | undefined;
-    cursorEntryPath: Id[];
-    status: "applied" | "rejected" | "discarded";
-  } {
+    replacement: WorkPatch | null,
+  ): ProposalMutation {
     if (decision === "reject" || decision === "discard") {
       return {
-        rootNodeRevisionId: undefined,
+        kind: "unchanged",
         cursorEntryPath: resolved.cursor.entryPath,
         status: decision === "reject" ? "rejected" : "discarded",
       };
@@ -377,7 +395,7 @@ export class ContinuationModel {
     const patch = decision === "accept" ? proposal.patch : replacement;
     if (!patch) throw new RepositoryError("invariant", "proposal decision requires a patch");
     const mutation = this.edit(resolved, patch);
-    return { ...mutation, status: "applied" };
+    return { kind: "snapshot", ...mutation, status: "applied" };
   }
 
   listNodeRevisions(node: ResolvedNode): NodeRevision[] {
@@ -550,7 +568,7 @@ export class ContinuationModel {
       for (const editPath of edits.keys()) {
         const parsed = this.keyPath(editPath);
         if (parsed.length > path.length && this.startsWith(parsed.slice(0, path.length), path)) {
-          childIds.add(this.required(parsed[path.length], "path edit is missing a child entry"));
+          childIds.add(this.valueAt(parsed, path.length, "path edit is missing a child entry"));
         }
       }
       let changed = false;
@@ -596,7 +614,11 @@ export class ContinuationModel {
     }
 
     const parentPath = entryPath.slice(0, -1);
-    const targetEntryId = this.required(entryPath[entryPath.length - 1], "replacement target is missing");
+    const targetEntryId = this.valueAt(
+      entryPath,
+      entryPath.length - 1,
+      "replacement target is missing",
+    );
     return this.replaceChild(
       rootNodeRevisionId,
       parentPath,
@@ -753,7 +775,7 @@ export class ContinuationModel {
     return prefix.every((entry, index) => value[index] === entry);
   }
 
-  private mergeWork(base: WorkFields, patch: WorkPatch | undefined): WorkFields {
+  private mergeWork(base: WorkFields, patch: WorkPatch): WorkFields {
     return WorkFieldsSchema.parse({ ...base, ...patch });
   }
 
@@ -770,8 +792,11 @@ export class ContinuationModel {
     return platform() === "win32" ? absolutePath.toLowerCase() : absolutePath;
   }
 
-  private required<T>(value: T | undefined, message: string): T {
-    if (value === undefined) throw new RepositoryError("invariant", message);
-    return value;
+  private valueAt<T>(values: readonly T[], index: number, message: string): T {
+    if (index < 0 || index >= values.length) {
+      throw new RepositoryError("invariant", message);
+    }
+
+    return values[index];
   }
 }

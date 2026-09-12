@@ -45,16 +45,17 @@ export class ContinuationController {
   dispatch(name: OperationName, raw: unknown, idempotencyKey?: string): unknown {
     const started = Date.now();
     const sessionId = this.sessionIdFrom(raw);
+    const key = idempotencyKey ?? null;
     const before = this.diagnosticState(sessionId);
-    const replay = sessionId && idempotencyKey
-      ? this.records.findReceipt(sessionId, idempotencyKey) !== undefined
+    const replay = sessionId !== null && key !== null
+      ? this.records.findReceipt(sessionId, key) !== null
       : false;
     try {
-      const result = OperationSchemas[name].output.parse(this.dispatchValidated(name, raw, idempotencyKey));
-      this.diagnostic(sessionId, name, idempotencyKey, replay ? "replay" : "result", started, before, result);
+      const result = OperationSchemas[name].output.parse(this.dispatchValidated(name, raw, key));
+      this.diagnostic(sessionId, name, key, replay ? "replay" : "result", started, before, result);
       return result;
     } catch (error) {
-      this.diagnostic(sessionId, name, idempotencyKey, "error", started, before, undefined, error);
+      this.diagnostic(sessionId, name, key, "error", started, before, null, error);
       throw error;
     }
   }
@@ -67,7 +68,7 @@ export class ContinuationController {
     return { protocolVersion: PROTOCOL_VERSION, id, ok: false, error: { code, message } };
   }
 
-  private dispatchValidated(name: OperationName, raw: unknown, key?: string): unknown {
+  private dispatchValidated(name: OperationName, raw: unknown, key: string | null): unknown {
     switch (name) {
       case "hello": return this.hello(raw);
       case "describe": OperationSchemas.describe.input.parse(raw); return this.describe();
@@ -95,15 +96,16 @@ export class ContinuationController {
     return { protocolVersion: PROTOCOL_VERSION, schemaDigest, daemon: "context-tree-v3" };
   }
 
-  private pwd(raw: unknown, key?: string): PwdState {
+  private pwd(raw: unknown, key: string | null): PwdState {
     const input = OperationSchemas.pwd.input.parse(raw);
-    return this.command(input.sessionId, key, () => {
+    return this.command(input.sessionId, key, OperationSchemas.pwd.output, () => {
       const existing = this.records.findSession(input.sessionId);
       if (existing) {
         if (input.cwd) this.model.validateWorkspace(existing, input.cwd);
         return this.pwdState(this.model.resolveSession(input.sessionId));
       }
-      const resolved = this.model.createSession(input.sessionId, input.cwd ?? process.cwd());
+      const cwd = input.cwd ?? process.cwd();
+      const resolved = this.model.createSession(input.sessionId, cwd);
       this.records.appendJournal({ sessionId: input.sessionId, operation: "pwd", previousSnapshotId: null, nextSnapshotId: resolved.snapshot.id, cursorEntryPath: [], idempotencyKey: key, payload: {} });
       return this.pwdState(resolved);
     });
@@ -112,39 +114,39 @@ export class ContinuationController {
   private ls(raw: unknown) {
     const input = OperationSchemas.ls.input.parse(raw);
     const resolved = this.model.resolveSession(input.sessionId);
-    const listed = this.model.resolvePath(resolved, input.path);
+    const listed = this.model.resolvePath(resolved, input.path ?? ".");
     return { ...this.cursorState(resolved), listedPath: this.model.path(listed), entries: this.entries(listed) };
   }
 
-  private cd(raw: unknown, key?: string): CursorState {
+  private cd(raw: unknown, key: string | null): CursorState {
     const input = OperationSchemas.cd.input.parse(raw);
-    return this.mutation(input.sessionId, key, "cd", (resolved) => this.model.cd(resolved, input.path));
+    return this.mutation(input.sessionId, key, "cd", OperationSchemas.cd.output, (resolved) => this.model.cd(resolved, input.path));
   }
 
-  private mkdir(raw: unknown, key?: string): CursorState {
+  private mkdir(raw: unknown, key: string | null): CursorState {
     const input = OperationSchemas.mkdir.input.parse(raw);
-    return this.mutation(input.sessionId, key, "mkdir", (resolved) => this.model.mkdir(resolved, input.name, input.work));
+    return this.mutation(input.sessionId, key, "mkdir", OperationSchemas.mkdir.output, (resolved) => this.model.mkdir(resolved, input.name, input.work ?? {}));
   }
 
-  private edit(raw: unknown, key?: string): CursorState {
+  private edit(raw: unknown, key: string | null): CursorState {
     const input = OperationSchemas.edit.input.parse(raw);
-    return this.mutation(input.sessionId, key, "edit", (resolved) => this.model.edit(resolved, input.patch));
+    return this.mutation(input.sessionId, key, "edit", OperationSchemas.edit.output, (resolved) => this.model.edit(resolved, input.patch));
   }
 
-  private move(raw: unknown, key?: string): CursorState {
+  private move(raw: unknown, key: string | null): CursorState {
     const input = OperationSchemas.mv.input.parse(raw);
-    return this.mutation(input.sessionId, key, "mv", (resolved) => this.model.move(resolved, input.source, input.destination));
+    return this.mutation(input.sessionId, key, "mv", OperationSchemas.mv.output, (resolved) => this.model.move(resolved, input.source, input.destination));
   }
 
-  private close(raw: unknown, key?: string): CursorState {
+  private close(raw: unknown, key: string | null): CursorState {
     const input = OperationSchemas.close.input.parse(raw);
-    return this.mutation(input.sessionId, key, "close", (resolved) => this.model.close(resolved, input.summary, input.status));
+    return this.mutation(input.sessionId, key, "close", OperationSchemas.close.output, (resolved) => this.model.close(resolved, input.summary, input.status));
   }
 
   private search(raw: unknown) {
     const input = OperationSchemas.search.input.parse(raw);
     const resolved = this.model.resolveSession(input.sessionId);
-    const target = this.model.resolvePath(resolved, input.path);
+    const target = this.model.resolvePath(resolved, input.path ?? ".");
     const needle = input.query.toLocaleLowerCase();
     const candidates = input.scope === "subtree"
       ? this.model.allNodesBelow(target)
@@ -158,21 +160,21 @@ export class ContinuationController {
   private revisionList(raw: unknown) {
     const input = OperationSchemas["rev-list"].input.parse(raw);
     const resolved = this.model.resolveSession(input.sessionId);
-    const target = this.model.resolvePath(resolved, input.path);
+    const target = this.model.resolvePath(resolved, input.path ?? ".");
     return { ...this.cursorState(resolved), revisions: this.model.listNodeRevisions(target).map((revision) => this.revisionSummary(revision.id)) };
   }
 
   private revisionShow(raw: unknown) {
     const input = OperationSchemas["rev-show"].input.parse(raw);
     const resolved = this.model.resolveSession(input.sessionId);
-    const target = this.model.resolvePath(resolved, input.path);
+    const target = this.model.resolvePath(resolved, input.path ?? ".");
     const revision = this.model.revisionOnLineage(target, input.revisionId);
     return { ...this.cursorState(resolved), details: { revision: this.revisionSummary(revision.id), work: this.model.work(this.records.getPayloadRevision(revision.payloadRevisionId)), entries: this.entriesForRevision(revision.id) } };
   }
 
-  private fork(raw: unknown, key?: string) {
+  private fork(raw: unknown, key: string | null) {
     const input = OperationSchemas.fork.input.parse(raw);
-    return this.command(input.sessionId, key, () => {
+    return this.command(input.sessionId, key, OperationSchemas.fork.output, () => {
       const before = this.model.resolveSession(input.sessionId);
       const forked = this.model.fork(before, input.newSessionId);
       this.records.appendJournal({ sessionId: input.sessionId, operation: "fork", previousSnapshotId: before.snapshot.id, nextSnapshotId: before.snapshot.id, cursorEntryPath: before.cursor.entryPath, idempotencyKey: key, payload: { forkedSessionId: input.newSessionId } });
@@ -197,54 +199,67 @@ export class ContinuationController {
     return { ...this.cursorState(resolved), proposals: this.records.listPendingProposals(input.sessionId).map((proposal) => this.proposal(proposal)) };
   }
 
-  private decideProposal(raw: unknown, key?: string) {
+  private decideProposal(raw: unknown, key: string | null) {
     const input = OperationSchemas["decide-proposal"].input.parse(raw);
-    return this.command(input.sessionId, key, () => {
+    return this.command(input.sessionId, key, OperationSchemas["decide-proposal"].output, () => {
       const resolved = this.model.resolveSession(input.sessionId);
       const proposal = this.records.getPendingProposal(input.proposalId, input.sessionId);
-      const decision = this.model.decideProposal(resolved, proposal, input.decision, input.replacement);
+      const decision = this.model.decideProposal(resolved, proposal, input.decision, input.replacement ?? null);
       this.records.updateProposalStatus(proposal.id, decision.status);
-      const next = decision.rootNodeRevisionId === undefined
+      const next = decision.kind === "unchanged"
         ? resolved
         : this.persistMutation(resolved, "decide-proposal", key, {
           rootNodeRevisionId: decision.rootNodeRevisionId,
           cursorEntryPath: decision.cursorEntryPath,
         });
-      if (decision.rootNodeRevisionId === undefined) this.records.appendJournal({ sessionId: input.sessionId, operation: "decide-proposal", previousSnapshotId: resolved.snapshot.id, nextSnapshotId: resolved.snapshot.id, cursorEntryPath: resolved.cursor.entryPath, idempotencyKey: key, payload: { proposalId: proposal.id, status: decision.status } });
+      if (decision.kind === "unchanged") this.records.appendJournal({ sessionId: input.sessionId, operation: "decide-proposal", previousSnapshotId: resolved.snapshot.id, nextSnapshotId: resolved.snapshot.id, cursorEntryPath: resolved.cursor.entryPath, idempotencyKey: key, payload: { proposalId: proposal.id, status: decision.status } });
       return { ...this.cursorState(next), proposalId: proposal.id, status: decision.status };
     });
   }
 
-  private submitProposal(raw: unknown, key?: string): ProposalSummary {
+  private submitProposal(raw: unknown, key: string | null): ProposalSummary {
     const input = OperationSchemas["submit-proposal"].input.parse(raw);
-    return this.command(input.sessionId, key, () => {
+    return this.command(input.sessionId, key, OperationSchemas["submit-proposal"].output, () => {
       const resolved = this.model.resolveSession(input.sessionId);
-      const proposal = this.model.createProposal(resolved, input.kind, input.patch, input.sourceSessionId);
+      const proposal = this.model.createProposal(resolved, input.kind, input.patch ?? null, input.sourceSessionId ?? null);
       this.records.appendJournal({ sessionId: input.sessionId, operation: "submit-proposal", previousSnapshotId: resolved.snapshot.id, nextSnapshotId: resolved.snapshot.id, cursorEntryPath: resolved.cursor.entryPath, idempotencyKey: key, payload: { proposalId: proposal.id } });
       return this.proposal(proposal);
     });
   }
 
-  private mutation(sessionId: string, key: string | undefined, operation: string, change: (resolved: ResolvedSession) => Mutation): CursorState {
-    return this.command(sessionId, key, () => {
+  private mutation<T extends CursorState>(
+    sessionId: string,
+    key: string | null,
+    operation: string,
+    resultSchema: z.ZodType<T>,
+    change: (resolved: ResolvedSession) => Mutation,
+  ): T {
+    return this.command(sessionId, key, resultSchema, () => {
       const resolved = this.model.resolveSession(sessionId);
-      return this.cursorState(this.persistMutation(resolved, operation, key, change(resolved)));
+      return resultSchema.parse(
+        this.cursorState(this.persistMutation(resolved, operation, key, change(resolved))),
+      );
     });
   }
 
-  private command<T>(sessionId: string, key: string | undefined, work: () => T): T {
+  private command<T>(
+    sessionId: string,
+    key: string | null,
+    resultSchema: z.ZodType<T>,
+    work: () => T,
+  ): T {
     return this.records.transaction(() => {
-      if (key) {
+      if (key !== null) {
         const replay = this.records.findReceipt(sessionId, key);
-        if (replay !== undefined) return replay as T;
+        if (replay !== null) return resultSchema.parse(replay);
       }
-      const result = work();
-      if (key) this.records.saveReceipt(sessionId, key, result);
+      const result = resultSchema.parse(work());
+      if (key !== null) this.records.saveReceipt(sessionId, key, result);
       return result;
     });
   }
 
-  private persistMutation(resolved: ResolvedSession, operation: string, key: string | undefined, mutation: Mutation): ResolvedSession {
+  private persistMutation(resolved: ResolvedSession, operation: string, key: string | null, mutation: Mutation): ResolvedSession {
     const changed = mutation.rootNodeRevisionId !== resolved.snapshot.rootNodeRevisionId;
     const snapshot = changed ? this.records.insertSnapshot(mutation.rootNodeRevisionId, resolved.snapshot.id) : resolved.snapshot;
     if (changed) this.records.updateSessionHead(resolved.session.id, snapshot.id);
@@ -302,26 +317,26 @@ export class ContinuationController {
       case "session": return [resolved.snapshot.rootNodeRevisionId];
       case "workspace": return this.records.listSessionHeadSnapshotIds(resolved.session.workspaceId)
         .map((snapshotId) => this.records.getSnapshot(snapshotId).rootNodeRevisionId);
-      case "global": return this.records.listSessionHeadSnapshotIds()
+      case "global": return this.records.listSessionHeadSnapshotIds(null)
         .map((snapshotId) => this.records.getSnapshot(snapshotId).rootNodeRevisionId);
-      case "history": return this.records.listHistoricalSnapshotRootRevisionIds();
+      case "history": return this.records.listHistoricalSnapshotRootRevisionIds(null);
     }
   }
 
-  private sessionIdFrom(raw: unknown): string | undefined {
+  private sessionIdFrom(raw: unknown): string | null {
     const parsed = z.object({ sessionId: z.string() }).passthrough().safeParse(raw);
-    return parsed.success ? parsed.data.sessionId : undefined;
+    return parsed.success ? parsed.data.sessionId : null;
   }
 
   private diagnostic(
-    sessionId: string | undefined,
+    sessionId: string | null,
     operation: string,
-    idempotencyKey: string | undefined,
+    idempotencyKey: string | null,
     outcome: "result" | "replay" | "error",
     started: number,
-    before: { headSnapshotId?: Id; cursorDepth?: number; currentNodeRevisionId?: Id },
-    result?: unknown,
-    error?: unknown,
+    before: { headSnapshotId: Id | null; cursorDepth: number | null; currentNodeRevisionId: Id | null },
+    result: unknown | null,
+    error: unknown | null = null,
   ): void {
     const after = this.diagnosticState(sessionId);
     const base = {
@@ -345,14 +360,14 @@ export class ContinuationController {
     writeDiagnostic(base);
   }
 
-  private diagnosticState(sessionId: string | undefined): {
-    headSnapshotId?: Id;
-    cursorDepth?: number;
-    currentNodeRevisionId?: Id;
+  private diagnosticState(sessionId: string | null): {
+    headSnapshotId: Id | null;
+    cursorDepth: number | null;
+    currentNodeRevisionId: Id | null;
   } {
-    if (!sessionId) return {};
+    if (sessionId === null) return this.emptyDiagnosticState();
     const session = this.records.findSession(sessionId);
-    if (!session) return {};
+    if (!session) return this.emptyDiagnosticState();
     try {
       const resolved = this.model.resolveSession(sessionId);
       return {
@@ -361,8 +376,20 @@ export class ContinuationController {
         currentNodeRevisionId: this.model.current(resolved).nodeRevision.id,
       };
     } catch {
-      return { headSnapshotId: session.headSnapshotId };
+      return {
+        headSnapshotId: session.headSnapshotId,
+        cursorDepth: null,
+        currentNodeRevisionId: null,
+      };
     }
+  }
+
+  private emptyDiagnosticState(): {
+    headSnapshotId: null;
+    cursorDepth: null;
+    currentNodeRevisionId: null;
+  } {
+    return { headSnapshotId: null, cursorDepth: null, currentNodeRevisionId: null };
   }
 }
 

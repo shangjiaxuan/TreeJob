@@ -9,11 +9,27 @@ const at = (...parts) => join(root, ...parts);
 await import("./scripts/generate-contracts.mjs");
 
 await rm(at("dist"), { recursive: true, force: true });
-await Promise.all([
-  build({ entryPoints: [at("src", "daemon.ts")], outfile: at("dist", "daemon.mjs"), bundle: true, platform: "node", format: "esm", target: "node22" }),
-  build({ entryPoints: [at("src", "mcp.ts")], outfile: at("dist", "mcp.mjs"), bundle: true, platform: "node", format: "esm", target: "node22" }),
-  build({ entryPoints: [at("src", "hook.ts")], outfile: at("dist", "hook.mjs"), bundle: true, platform: "node", format: "esm", target: "node22" }),
-  build({ entryPoints: [at("src", "shell.ts")], outfile: at("dist", "shell.mjs"), bundle: true, platform: "node", format: "esm", target: "node22" }),
-  build({ entryPoints: [at("test", "core.test.ts")], outfile: at("dist", "test", "core.test.mjs"), bundle: true, platform: "node", format: "esm", target: "node22" })
-]);
+
+const bundles = [
+  { entry: ["src", "daemon.ts"], output: ["dist", "daemon.mjs"] },
+  { entry: ["src", "mcp.ts"], output: ["dist", "mcp.mjs"] },
+  { entry: ["src", "hook.ts"], output: ["dist", "hook.mjs"] },
+  { entry: ["src", "shell.ts"], output: ["dist", "shell.mjs"] },
+  { entry: ["test", "core.test.ts"], output: ["dist", "test", "core.test.mjs"] },
+];
+
+for (const bundle of bundles) {
+  const entryPoint = at(...bundle.entry);
+  const outfile = at(...bundle.output);
+
+  await build({
+    entryPoints: [entryPoint],
+    outfile,
+    bundle: true,
+    platform: "node",
+    format: "esm",
+    target: "node22",
+  });
+}
+
 await copyFile(at("src", "compact-schema.json"), at("dist", "compact-schema.json"));

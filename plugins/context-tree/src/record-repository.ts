@@ -99,7 +99,7 @@ export type JournalEntry = {
   previousSnapshotId: Id | null;
   nextSnapshotId: Id | null;
   cursorEntryPath: Id[];
-  idempotencyKey?: string;
+  idempotencyKey: string | null;
   payload: JsonValue;
 };
 
@@ -118,11 +118,11 @@ type Row = z.infer<typeof RowSchema>;
 
 export interface RecordRepository {
   transaction<T>(work: () => T): T;
-  findWorkspace(canonicalPath: string): Workspace | undefined;
+  findWorkspace(canonicalPath: string): Workspace | null;
   insertWorkspace(canonicalPath: string): Workspace;
   getWorkspace(id: Id): Workspace;
   getSession(id: string): Session;
-  findSession(id: string): Session | undefined;
+  findSession(id: string): Session | null;
   insertSession(session: Session): void;
   updateSessionHead(sessionId: string, snapshotId: Id): void;
   getCursor(sessionId: string): Cursor;
@@ -161,11 +161,11 @@ export interface RecordRepository {
   listPendingProposals(sessionId: string): Proposal[];
   getPendingProposal(id: Id, sessionId: string): Proposal;
   updateProposalStatus(id: Id, status: ProposalStatus): void;
-  findReceipt(sessionId: string, key: string): unknown | undefined;
+  findReceipt(sessionId: string, key: string): JsonValue | null;
   saveReceipt(sessionId: string, key: string, result: unknown): void;
   appendJournal(entry: JournalEntry): void;
-  listSessionHeadSnapshotIds(workspaceId?: Id): Id[];
-  listHistoricalSnapshotRootRevisionIds(workspaceId?: Id): Id[];
+  listSessionHeadSnapshotIds(workspaceId: Id | null): Id[];
+  listHistoricalSnapshotRootRevisionIds(workspaceId: Id | null): Id[];
 }
 
 export class SqliteRecordRepository implements RecordRepository {
@@ -193,9 +193,9 @@ export class SqliteRecordRepository implements RecordRepository {
     }
   }
 
-  findWorkspace(canonicalPath: string): Workspace | undefined {
+  findWorkspace(canonicalPath: string): Workspace | null {
     const row = this.one("SELECT * FROM workspaces_v3 WHERE canonical_path=?", canonicalPath);
-    return row ? this.workspace(row) : undefined;
+    return row ? this.workspace(row) : null;
   }
 
   insertWorkspace(canonicalPath: string): Workspace {
@@ -219,9 +219,9 @@ export class SqliteRecordRepository implements RecordRepository {
     return session;
   }
 
-  findSession(id: string): Session | undefined {
+  findSession(id: string): Session | null {
     const row = this.one("SELECT * FROM sessions_v3 WHERE id=?", id);
-    return row ? this.session(row) : undefined;
+    return row ? this.session(row) : null;
   }
 
   insertSession(session: Session): void {
@@ -298,7 +298,7 @@ export class SqliteRecordRepository implements RecordRepository {
       "INSERT INTO payload_revisions_v3(node_id,predecessor_id,version,kind,title,objective,rationale,current_state," +
         "open_questions_json,return_condition,refs_json,metadata_json,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
       nodeId,
-      predecessor?.id ?? null,
+      predecessor === null ? null : predecessor.id,
       predecessor ? predecessor.version + 1 : 0,
       fields.kind,
       fields.title,
@@ -331,7 +331,7 @@ export class SqliteRecordRepository implements RecordRepository {
     const id = this.insert(
       "INSERT INTO directory_revisions_v3(node_id,predecessor_id,version,created_at) VALUES(?,?,?,?)",
       nodeId,
-      predecessor?.id ?? null,
+      predecessor === null ? null : predecessor.id,
       predecessor ? predecessor.version + 1 : 0,
       this.timestamp(),
     );
@@ -373,7 +373,7 @@ export class SqliteRecordRepository implements RecordRepository {
     const id = this.insert(
       "INSERT INTO entry_revisions_v3(entry_id,predecessor_id,version,name,created_at) VALUES(?,?,?,?,?)",
       entryId,
-      predecessor?.id ?? null,
+      predecessor === null ? null : predecessor.id,
       predecessor ? predecessor.version + 1 : 0,
       name,
       this.timestamp(),
@@ -403,7 +403,7 @@ export class SqliteRecordRepository implements RecordRepository {
     const id = this.insert(
       "INSERT INTO node_revisions_v3(node_id,predecessor_id,payload_revision_id,directory_revision_id,created_at) VALUES(?,?,?,?,?)",
       nodeId,
-      predecessor?.id ?? null,
+      predecessor === null ? null : predecessor.id,
       payloadRevisionId,
       directoryRevisionId,
       this.timestamp(),
@@ -472,18 +472,18 @@ export class SqliteRecordRepository implements RecordRepository {
       .run(status, this.timestamp(), id);
   }
 
-  findReceipt(sessionId: string, key: string): unknown | undefined {
+  findReceipt(sessionId: string, key: string): JsonValue | null {
     const row = this.one(
       "SELECT result_json FROM receipts_v3 WHERE session_id=? AND idempotency_key=?",
       sessionId,
       key,
     );
-    return row ? JSON.parse(String(row.result_json)) : undefined;
+    return row ? JsonSchema.parse(JSON.parse(String(row.result_json))) : null;
   }
 
   saveReceipt(sessionId: string, key: string, result: unknown): void {
     this.db.prepare("INSERT INTO receipts_v3 VALUES(?,?,?,?)")
-      .run(sessionId, key, JSON.stringify(result), this.timestamp());
+      .run(sessionId, key, JSON.stringify(JsonSchema.parse(result)), this.timestamp());
   }
 
   appendJournal(entry: JournalEntry): void {
@@ -495,22 +495,22 @@ export class SqliteRecordRepository implements RecordRepository {
       entry.previousSnapshotId,
       entry.nextSnapshotId,
       JSON.stringify(entry.cursorEntryPath),
-      entry.idempotencyKey ?? null,
+      entry.idempotencyKey,
       JSON.stringify(entry.payload),
       this.timestamp(),
     );
   }
 
-  listSessionHeadSnapshotIds(workspaceId?: Id): Id[] {
-    const query = workspaceId === undefined
+  listSessionHeadSnapshotIds(workspaceId: Id | null): Id[] {
+    const query = workspaceId === null
       ? "SELECT head_snapshot_id FROM sessions_v3"
       : "SELECT head_snapshot_id FROM sessions_v3 WHERE workspace_id=?";
-    const rows = workspaceId === undefined ? this.all(query) : this.all(query, workspaceId);
+    const rows = workspaceId === null ? this.all(query) : this.all(query, workspaceId);
     return rows.map((row) => this.id(row.head_snapshot_id));
   }
 
-  listHistoricalSnapshotRootRevisionIds(workspaceId?: Id): Id[] {
-    const seed = workspaceId === undefined
+  listHistoricalSnapshotRootRevisionIds(workspaceId: Id | null): Id[] {
+    const seed = workspaceId === null
       ? "SELECT head_snapshot_id AS id FROM sessions_v3"
       : "SELECT head_snapshot_id AS id FROM sessions_v3 WHERE workspace_id=?";
     const query = "WITH RECURSIVE lineage(id) AS (" + seed + " UNION " +
@@ -518,7 +518,7 @@ export class SqliteRecordRepository implements RecordRepository {
       "ON snapshots_v3.id=lineage.id WHERE snapshots_v3.parent_snapshot_id IS NOT NULL) " +
       "SELECT DISTINCT snapshots_v3.root_node_revision_id FROM snapshots_v3 JOIN lineage " +
       "ON snapshots_v3.id=lineage.id";
-    const rows = workspaceId === undefined ? this.all(query) : this.all(query, workspaceId);
+    const rows = workspaceId === null ? this.all(query) : this.all(query, workspaceId);
     return rows.map((row) => this.id(row.root_node_revision_id));
   }
 
@@ -562,9 +562,9 @@ export class SqliteRecordRepository implements RecordRepository {
     };
   }
 
-  private one(sql: string, ...values: SqlValue[]): Row | undefined {
+  private one(sql: string, ...values: SqlValue[]): Row | null {
     const row = this.db.prepare(sql).get(...values);
-    return row === undefined ? undefined : RowSchema.parse(row);
+    return row === undefined ? null : RowSchema.parse(row);
   }
 
   private all(sql: string, ...values: SqlValue[]): Row[] {
