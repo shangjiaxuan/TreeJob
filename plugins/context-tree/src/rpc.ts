@@ -71,9 +71,34 @@ export async function call<N extends OperationName>(
   }
 }
 
-function send<N extends OperationName>(
-  method: N,
-  params: OperationInput<N>,
+/**
+ * Invoke an operation selected at runtime. This is for protocol views such as
+ * the development shell: its operation name and object are not synthesized or
+ * reinterpreted by a second command language.
+ */
+export async function callRaw(
+  method: OperationName,
+  rawParams: unknown,
+  timeout = 8_000,
+): Promise<unknown> {
+  const params = OperationSchemas[method].input.parse(rawParams);
+  const directory = dataDir();
+  mkdirSync(directory, { recursive: true });
+
+  try {
+    await hello();
+    const response = await send(method, params, timeout);
+    return OperationSchemas[method].output.parse(response);
+  } catch {
+    await startDaemon(directory);
+    const response = await send(method, params, timeout);
+    return OperationSchemas[method].output.parse(response);
+  }
+}
+
+function send(
+  method: OperationName,
+  params: unknown,
   timeout: number,
 ): Promise<unknown> {
   return new Promise((resolve, reject) => {

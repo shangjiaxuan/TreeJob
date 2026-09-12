@@ -110,6 +110,28 @@ export class ContinuationModel {
     const unresolved = this.payloadIds(snapshot.rootDirectoryId)
       .map((inodeId) => this.records.getPayload(inodeId))
       .filter((inode) => !terminalStatuses.has(inode.status));
+    const ancestorBriefing = resolvedPath.map((inodeId) => {
+      const directory = this.findDirectory(snapshot.rootDirectoryId, inodeId);
+
+      if (!directory) {
+        throw new RepositoryError(
+          "invariant",
+          "active ancestor is not reachable from session head",
+        );
+      }
+
+      const childOutcomes = directory.entries
+        .map((entry) => this.records.getDirectory(entry.directoryId))
+        .map((childDirectory) =>
+          this.records.getPayload(childDirectory.payloadId),
+        )
+        .filter((child) => terminalStatuses.has(child.status));
+
+      return {
+        record: this.records.getPayload(inodeId),
+        childOutcomes,
+      };
+    });
 
     return ContextSchema.parse({
       sessionId,
@@ -122,6 +144,7 @@ export class ContinuationModel {
       }),
       pendingProposals: this.records.listPendingProposals(sessionId),
       unresolved,
+      ancestorBriefing,
     });
   }
 
@@ -449,14 +472,20 @@ export class ContinuationModel {
     scope: "active_path" | "session_tree" | "workspace" | "global" | "history",
   ): PayloadInode[] {
     const context = this.context(sessionId);
+    const normalizedQuery = query.toLowerCase();
     const contains = (inode: PayloadInode): boolean => {
-      const fields = [
+      const searchableText = [
         inode.title,
         inode.objective,
+        inode.rationale,
         inode.currentState,
+        ...inode.openQuestions,
+        inode.returnCondition,
+        JSON.stringify(inode.refs),
+        JSON.stringify(inode.metadata),
       ].join("\n").toLowerCase();
 
-      return fields.includes(query.toLowerCase());
+      return searchableText.includes(normalizedQuery);
     };
 
     if (scope === "active_path") {

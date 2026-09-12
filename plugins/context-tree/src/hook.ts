@@ -5,6 +5,10 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import {
+  renderAncestorBriefing,
+  renderMinimalPath,
+} from "./briefing.js";
 import { call, dataDir } from "./rpc.js";
 import {
   PayloadPatchSchema,
@@ -64,7 +68,7 @@ async function handleSessionStart(event: HookEvent): Promise<void> {
     commandId: eventKey(event, "SessionStart"),
   });
 
-  writeOutput(contextBrief(context));
+  writeOutput(contextRestoreBrief(context));
 }
 
 async function handleSubagentStart(event: HookEvent): Promise<void> {
@@ -75,7 +79,7 @@ async function handleSubagentStart(event: HookEvent): Promise<void> {
     commandId: eventKey(event, "SubagentStart"),
   });
 
-  writeOutput(contextBrief(context));
+  writeOutput(contextRestoreBrief(context));
 }
 
 async function handleSubagentStop(event: HookEvent): Promise<void> {
@@ -256,22 +260,13 @@ function eventKey(event: HookEvent, kind: string): string {
   ].join("|")).digest("hex");
 }
 
-function contextBrief(
+function contextRestoreBrief(
   context: Awaited<ReturnType<typeof call<"getContext">>>,
 ): string {
-  const activePath = context.activePath
-    .map((inode) => {
-      const detail = inode.currentState || inode.returnCondition;
-      return "- " + inode.title + ": " + detail;
-    })
-    .join("\n");
-
   return [
-    "CONTEXT TREE",
-    "Active path:",
-    activePath,
-    "Pending proposals: " + context.pendingProposals.length,
-  ].join("\n");
+    renderMinimalPath(context),
+    renderAncestorBriefing(context),
+  ].join("\n\n");
 }
 
 function writeOutput(context?: string, systemMessage?: string): void {

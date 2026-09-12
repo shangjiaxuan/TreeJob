@@ -189,6 +189,12 @@ export interface Proposal {
 }
 
 /** @schema @strict */
+export interface AncestorBriefingEntry {
+  record: PayloadInode;
+  childOutcomes: PayloadInode[];
+}
+
+/** @schema @strict */
 export interface Context {
   sessionId: string;
   headSnapshotId: InodeId;
@@ -197,6 +203,7 @@ export interface Context {
   children: PayloadInode[];
   pendingProposals: Proposal[];
   unresolved: PayloadInode[];
+  ancestorBriefing: AncestorBriefingEntry[];
 }
 
 /** @schema */

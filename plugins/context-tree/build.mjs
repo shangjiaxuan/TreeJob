@@ -13,6 +13,7 @@ await Promise.all([
   build({ entryPoints: [at("src", "daemon.ts")], outfile: at("dist", "daemon.mjs"), bundle: true, platform: "node", format: "esm", target: "node22" }),
   build({ entryPoints: [at("src", "mcp.ts")], outfile: at("dist", "mcp.mjs"), bundle: true, platform: "node", format: "esm", target: "node22" }),
   build({ entryPoints: [at("src", "hook.ts")], outfile: at("dist", "hook.mjs"), bundle: true, platform: "node", format: "esm", target: "node22" }),
+  build({ entryPoints: [at("src", "shell.ts")], outfile: at("dist", "shell.mjs"), bundle: true, platform: "node", format: "esm", target: "node22" }),
   build({ entryPoints: [at("test", "core.test.ts")], outfile: at("dist", "test", "core.test.mjs"), bundle: true, platform: "node", format: "esm", target: "node22" })
 ]);
 await copyFile(at("src", "compact-schema.json"), at("dist", "compact-schema.json"));
