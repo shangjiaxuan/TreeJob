@@ -5,8 +5,8 @@ import {
   RevisionShowResultSchema,
   type CurrentWork,
   type EntrySummary,
-  type NodeRevisionSummary,
   type RecordStatus,
+  type RevisionSummary,
 } from "./schema.js";
 
 export type BrowserTreeEntry = {
@@ -20,40 +20,34 @@ export type BrowserTreeEntry = {
 export type BrowserView = {
   sessionId: string;
   currentPath: string;
-  selectedRevision: NodeRevisionSummary;
+  selectedRevision: RevisionSummary;
+  referenceRevision: number;
   work: CurrentWork;
   entries: EntrySummary[];
-  revisions: NodeRevisionSummary[];
+  revisions: RevisionSummary[];
   tree: BrowserTreeEntry;
 };
 
 export async function readBrowserView(
   sessionId: string,
   path: string,
-  revisionId: number | undefined,
+  revision: number | undefined,
+  reference: number | undefined,
 ): Promise<BrowserView> {
-  const [listed, revisionList, tree] = await Promise.all([
-    list(sessionId, path),
-    revisions(sessionId, path),
-    readTree(sessionId, "/", "/", "", "open"),
-  ]);
-  const selectedRevision = revisionId === undefined
-    ? revisionList.revisions[0]
-    : revisionList.revisions.find((revision) => revision.revisionId === revisionId);
-
-  if (!selectedRevision) {
-    throw new Error("revision is not available at the requested path");
-  }
-
+  const revisionList = await revisions(sessionId, path, reference);
+  const selectedRevision = revision ?? revisionList.head_revision;
+  const referenceRevision = reference ?? revisionList.head_revision;
   const shown = RevisionShowResultSchema.parse(await callCommand({
     sessionId,
-    command: ["rev-show", selectedRevision.revisionId, path],
+    command: ["rev-show", selectedRevision, path, "--reference", String(referenceRevision)],
   }));
+  const tree = await readTree(sessionId, "/", "/", "", "open", selectedRevision);
 
   return {
     sessionId,
-    currentPath: listed.listedPath,
+    currentPath: shown.details.view_path,
     selectedRevision: shown.details.revision,
+    referenceRevision,
     work: shown.details.work,
     entries: shown.details.entries,
     revisions: revisionList.revisions,
@@ -67,41 +61,27 @@ async function readTree(
   name: string,
   title: string,
   status: RecordStatus,
+  revision: number,
 ): Promise<BrowserTreeEntry> {
-  const listed = await list(sessionId, path);
+  const listed = await list(sessionId, path, revision, revision);
   const children = await Promise.all(listed.entries.map(async (entry) => {
     const childPath = joinPath(listed.listedPath, entry.name);
-    const child = await readTree(
-      sessionId,
-      childPath,
-      entry.name,
-      entry.title,
-      entry.status,
-    );
-    return child;
+    return readTree(sessionId, childPath, entry.name, entry.title, entry.status, revision);
   }));
-
-  return {
-    name,
-    path: listed.listedPath,
-    title,
-    status,
-    children,
-  };
+  return { name, path: listed.listedPath, title, status, children };
 }
 
-async function list(sessionId: string, path: string) {
+async function list(sessionId: string, path: string, revision: number, reference: number) {
   return ListResultSchema.parse(await callCommand({
     sessionId,
-    command: ["ls", path],
+    command: ["ls", path, "--revision", String(revision), "--reference", String(reference)],
   }));
 }
 
-async function revisions(sessionId: string, path: string) {
-  return RevisionListResultSchema.parse(await callCommand({
-    sessionId,
-    command: ["rev-list", path],
-  }));
+async function revisions(sessionId: string, path: string, reference: number | undefined) {
+  const command: (string | number)[] = ["rev-list", path];
+  if (reference !== undefined) command.push("--reference", String(reference));
+  return RevisionListResultSchema.parse(await callCommand({ sessionId, command }));
 }
 
 function joinPath(parent: string, name: string): string {

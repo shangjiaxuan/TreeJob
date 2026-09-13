@@ -1,6 +1,9 @@
 /** @schema @int @positive */
 export type Id = number;
 
+/** @schema @int @nonnegative */
+export type Revision = number;
+
 /** @schema @datetime */
 export type Timestamp = string;
 
@@ -17,12 +20,7 @@ export type JsonValue =
 export type CommandAtom = JsonValue;
 
 /** @schema */
-export type RecordStatus =
-  | "open"
-  | "blocked"
-  | "done"
-  | "abandoned"
-  | "superseded";
+export type RecordStatus = "open" | "blocked" | "done" | "abandoned" | "superseded";
 
 /** @schema */
 export type ProposalStatus = "pending" | "applied" | "rejected" | "discarded";
@@ -31,17 +29,13 @@ export type ProposalStatus = "pending" | "applied" | "rejected" | "discarded";
 export type ProposalKind = "compact" | "subagent_result" | "manual";
 
 /** @schema */
-export type ProposalDecision =
-  | "accept"
-  | "replace"
-  | "reject"
-  | "discard";
+export type ProposalDecision = "accept" | "replace" | "reject" | "discard";
 
 /** @schema */
 export type SearchScope = "subtree" | "session" | "workspace" | "global" | "history";
 
 /** @schema */
-export type RevisionChange = "payload" | "directory";
+export type RevisionChange = "work" | "children" | "renamed" | "moved";
 
 /** @schema @strict */
 export interface Reference {
@@ -54,31 +48,22 @@ export interface Reference {
 export interface WorkFields {
   /** @default node */
   kind: string;
-
   /** @default "" */
   title: string;
-
   /** @default "" */
   objective: string;
-
   /** @default "" */
   rationale: string;
-
   /** @default "" */
   currentState: string;
-
   /** @default [] */
   openQuestions: string[];
-
   /** @default "" */
   returnCondition: string;
-
   /** @default [] */
   refs: Reference[];
-
   /** @default {} */
   metadata: Record<string, JsonValue>;
-
   /** @default open */
   status: RecordStatus;
 }
@@ -126,8 +111,8 @@ export interface EntrySummary {
 }
 
 /** @schema @strict */
-export interface NodeRevisionSummary {
-  revisionId: Id;
+export interface RevisionSummary {
+  revision: Revision;
   createdAt: Timestamp;
   changes: RevisionChange[];
 }
@@ -137,11 +122,13 @@ export interface SearchMatch {
   path: string;
   name: string;
   work: CurrentWork;
+  revision?: Revision;
 }
 
 /** @schema @strict */
 export interface RevisionDetails {
-  revision: NodeRevisionSummary;
+  revision: RevisionSummary;
+  view_path: string;
   work: CurrentWork;
   entries: EntrySummary[];
 }
@@ -173,6 +160,7 @@ export interface BriefingResult extends CursorState {
 /** @schema @strict */
 export interface ListResult extends CursorState {
   listedPath: string;
+  view_path?: string;
   entries: EntrySummary[];
 }
 
@@ -183,7 +171,8 @@ export interface SearchResult extends CursorState {
 
 /** @schema @strict */
 export interface RevisionListResult extends CursorState {
-  revisions: NodeRevisionSummary[];
+  head_revision: Revision;
+  revisions: RevisionSummary[];
 }
 
 /** @schema @strict */
@@ -224,6 +213,17 @@ export interface PathInput extends SessionInput {
 }
 
 /** @schema @strict */
+export interface ListInput extends PathInput {
+  revision?: Revision;
+  reference?: Revision;
+}
+
+/** @schema @strict */
+export interface RevisionListInput extends PathInput {
+  reference?: Revision;
+}
+
+/** @schema @strict */
 export interface CdInput extends SessionInput {
   /** @minLength 1 */
   path: string;
@@ -245,7 +245,6 @@ export interface EditInput extends SessionInput {
 export interface MoveInput extends SessionInput {
   /** @minLength 1 */
   source: string;
-
   /** @minLength 1 */
   destination: string;
 }
@@ -254,7 +253,6 @@ export interface MoveInput extends SessionInput {
 export interface CloseInput extends SessionInput {
   /** @minLength 1 */
   summary: string;
-
   /** @default done */
   status: "done" | "abandoned" | "superseded";
 }
@@ -263,17 +261,16 @@ export interface CloseInput extends SessionInput {
 export interface SearchInput extends SessionInput {
   /** @minLength 1 */
   query: string;
-
   /** @default subtree */
   scope: SearchScope;
-
-  /** Relative or absolute subtree root; does not move the cursor. */
   path?: string;
 }
 
 /** @schema @strict */
-export interface RevisionShowInput extends PathInput {
-  revisionId: Id;
+export interface RevisionShowInput extends SessionInput {
+  revision: Revision;
+  path?: string;
+  reference?: Revision;
 }
 
 /** @schema @strict */
@@ -293,7 +290,6 @@ export interface DecideProposalInput extends SessionInput {
 export interface SubmitProposalInput extends SessionInput {
   kind: ProposalKind;
   patch?: WorkPatch;
-
   /** @minLength 1 */
   sourceSessionId?: string;
 }
@@ -302,7 +298,6 @@ export interface SubmitProposalInput extends SessionInput {
 export interface CommandInput {
   /** Required for every command except help. */
   sessionId?: string;
-
   /** @minItems 1 */
   command: CommandAtom[];
 }
@@ -322,15 +317,14 @@ export interface CommandHelpResult {
 
 /** @schema @strict */
 export interface HelloInput {
-  protocolVersion: 3;
-
+  protocolVersion: 4;
   /** @minLength 1 */
   schemaDigest: string;
 }
 
 /** @schema @strict */
 export interface HelloOutput {
-  protocolVersion: 3;
+  protocolVersion: 4;
   schemaDigest: string;
   daemon: string;
 }
@@ -339,28 +333,20 @@ export interface HelloOutput {
 export interface OperationContracts {
   hello: { input: HelloInput; output: HelloOutput; command: false };
   pwd: { input: PwdInput; output: PwdState; command: true };
-  ls: { input: PathInput; output: ListResult; command: false };
+  ls: { input: ListInput; output: ListResult; command: false };
   cd: { input: CdInput; output: CursorState; command: true };
   mkdir: { input: MkdirInput; output: CursorState; command: true };
   edit: { input: EditInput; output: CursorState; command: true };
   mv: { input: MoveInput; output: CursorState; command: true };
   close: { input: CloseInput; output: CursorState; command: true };
   search: { input: SearchInput; output: SearchResult; command: false };
-  "rev-list": { input: PathInput; output: RevisionListResult; command: false };
+  "rev-list": { input: RevisionListInput; output: RevisionListResult; command: false };
   "rev-show": { input: RevisionShowInput; output: RevisionShowResult; command: false };
   fork: { input: ForkInput; output: ForkResult; command: true };
   briefing: { input: SessionInput; output: BriefingResult; command: false };
   proposals: { input: SessionInput; output: ProposalListResult; command: false };
-  "decide-proposal": {
-    input: DecideProposalInput;
-    output: ProposalDecisionResult;
-    command: true;
-  };
-  "submit-proposal": {
-    input: SubmitProposalInput;
-    output: ProposalSummary;
-    command: true;
-  };
+  "decide-proposal": { input: DecideProposalInput; output: ProposalDecisionResult; command: true };
+  "submit-proposal": { input: SubmitProposalInput; output: ProposalSummary; command: true };
 }
 
 /** @schema */
@@ -370,13 +356,7 @@ export type OperationName = keyof OperationContracts;
 export type RpcMethod = "hello" | "command";
 
 /** @schema */
-export type RpcErrorCode =
-  | "validation"
-  | "unsupported_protocol"
-  | "not_found"
-  | "conflict"
-  | "invariant"
-  | "internal";
+export type RpcErrorCode = "validation" | "unsupported_protocol" | "not_found" | "conflict" | "invariant" | "internal";
 
 /** @schema @strict */
 export interface RpcError {
@@ -387,21 +367,18 @@ export interface RpcError {
 
 /** @schema @strict */
 export interface RpcRequest {
-  protocolVersion: 3;
-
+  protocolVersion: 4;
   /** @minLength 1 */
   id: string;
-
   /** @minLength 1 */
   idempotencyKey?: string;
-
   method: RpcMethod;
   params: JsonValue;
 }
 
 /** @schema @strict */
 export interface RpcSuccess {
-  protocolVersion: 3;
+  protocolVersion: 4;
   id: string;
   ok: true;
   result: JsonValue;
@@ -409,7 +386,7 @@ export interface RpcSuccess {
 
 /** @schema @strict */
 export interface RpcFailure {
-  protocolVersion: 3;
+  protocolVersion: 4;
   id: string;
   ok: false;
   error: RpcError;

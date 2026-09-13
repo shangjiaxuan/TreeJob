@@ -4,6 +4,7 @@ import {
   OperationSchemas,
   ProposalDecisionSchema,
   ProposalKindSchema,
+  RevisionSchema,
   SearchScopeSchema,
   StatusSchema,
   WorkPatchSchema,
@@ -55,10 +56,10 @@ const definitions: readonly CommandDefinition[] = [
   ),
   command(
     "ls",
-    "List direct children at the current or supplied path.",
-    "ls [path]",
+    "List direct children at a current or historical path.",
+    "ls [path] [--revision=N] [--reference=N]",
     "ls",
-    (sessionId, args) => ({ sessionId, path: optionalString(args, 0, "path") }),
+    (sessionId, args) => listInput(sessionId, args),
   ),
   command(
     "cd",
@@ -108,21 +109,17 @@ const definitions: readonly CommandDefinition[] = [
   ),
   command(
     "rev-list",
-    "List persistent revisions for the current node or a path.",
-    "rev-list [path]",
+    "List snapshot history for the current node or a path.",
+    "rev-list [path] [--reference=N]",
     "rev-list",
-    (sessionId, args) => ({ sessionId, path: optionalString(args, 0, "path") }),
+    (sessionId, args) => revisionListInput(sessionId, args),
   ),
   command(
     "rev-show",
-    "Show a node revision at the current node or a path.",
-    "rev-show <revision-id> [path]",
+    "Show a path at a selected session snapshot revision.",
+    "rev-show <revision> [path] [--reference=N]",
     "rev-show",
-    (sessionId, args) => ({
-      sessionId,
-      revisionId: id(args[0], "revision-id"),
-      path: optionalString(args, 1, "path"),
-    }),
+    (sessionId, args) => revisionShowInput(sessionId, args),
   ),
   command(
     "fork",
@@ -211,7 +208,7 @@ export function parseCommand(input: CommandInput): ParsedCommand {
     throw new Error("sessionId is required for command: " + commandName);
   }
 
-  if (definition.name !== "search") {
+  if (!["search", "ls", "rev-list", "rev-show"].includes(definition.name)) {
     rejectLongOptions(arguments_);
   }
 
@@ -263,6 +260,41 @@ function searchInput(sessionId: string, arguments_: readonly CommandAtom[]): unk
   }
 
   return { sessionId, query: requiredString(parsed.positionals, 0, "query"), scope, path };
+}
+
+function listInput(sessionId: string, arguments_: readonly CommandAtom[]): unknown {
+  const parsed = splitOptions(arguments_);
+  ensureOptions(parsed.options, ["revision", "reference"]);
+  requireArgumentCount(parsed.positionals, 0, 1);
+  return {
+    sessionId,
+    path: optionalString(parsed.positionals, 0, "path"),
+    revision: optionRevision(parsed.options, "revision"),
+    reference: optionRevision(parsed.options, "reference"),
+  };
+}
+
+function revisionListInput(sessionId: string, arguments_: readonly CommandAtom[]): unknown {
+  const parsed = splitOptions(arguments_);
+  ensureOptions(parsed.options, ["reference"]);
+  requireArgumentCount(parsed.positionals, 0, 1);
+  return {
+    sessionId,
+    path: optionalString(parsed.positionals, 0, "path"),
+    reference: optionRevision(parsed.options, "reference"),
+  };
+}
+
+function revisionShowInput(sessionId: string, arguments_: readonly CommandAtom[]): unknown {
+  const parsed = splitOptions(arguments_);
+  ensureOptions(parsed.options, ["reference"]);
+  requireArgumentCount(parsed.positionals, 1, 2);
+  return {
+    sessionId,
+    revision: revision(parsed.positionals[0], "revision"),
+    path: optionalString(parsed.positionals, 1, "path"),
+    reference: optionRevision(parsed.options, "reference"),
+  };
 }
 
 function rejectLongOptions(arguments_: readonly CommandAtom[]): void {
@@ -393,6 +425,22 @@ function id(value: CommandAtom | undefined, label: string): number {
   }
 
   throw new Error(label + " must be an integer");
+}
+
+function optionId(options: ReadonlyMap<string, string>, name: string): number | undefined {
+  const value = options.get(name);
+  return value === undefined ? undefined : id(value, "--" + name);
+}
+
+function revision(value: CommandAtom | undefined, label: string): number {
+  if (typeof value === "number") return RevisionSchema.parse(value);
+  if (typeof value === "string" && /^\d+$/.test(value)) return RevisionSchema.parse(Number(value));
+  throw new Error(label + " must be a non-negative integer");
+}
+
+function optionRevision(options: ReadonlyMap<string, string>, name: string): number | undefined {
+  const value = options.get(name);
+  return value === undefined ? undefined : revision(value, "--" + name);
 }
 
 function requiredObject(arguments_: readonly CommandAtom[], index: number, label: string): Record<string, JsonValue> {

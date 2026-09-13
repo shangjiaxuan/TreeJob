@@ -1,11 +1,11 @@
 import { z } from "zod";
 import { parseCommand } from "./commands.js";
-import { ContinuationModel, type ResolvedNode, type ResolvedSession } from "./continuation-model.js";
-import { RepositoryError, SqliteRecordRepository, type RecordRepository } from "./record-repository.js";
+import { ContinuationModel, type ResolvedNode, type ResolvedSession, type StateMutation } from "./continuation-model.js";
+import { RepositoryError, SqliteRecordRepository, type Proposal, type RecordRepository, type SessionRevision, type View } from "./record-repository.js";
 import { writeDiagnostic } from "./diagnostics.js";
 import {
-  OperationSchemas,
   CommandInputSchema,
+  OperationSchemas,
   PROTOCOL_VERSION,
   schemaDigest,
   type BriefingResult,
@@ -13,17 +13,15 @@ import {
   type CursorState,
   type EntrySummary,
   type Id,
-  type NodeRevisionSummary,
-  type OperationName,
   type ProposalSummary,
   type PwdState,
+  type RevisionSummary,
   type RpcResponse,
+  type SearchMatch,
   type WorkPatch,
 } from "./schema.js";
 
-type Mutation = { rootNodeRevisionId: Id; cursorEntryPath: Id[] };
-
-/** Transactional controller for the filesystem use cases. */
+/** Transactional controller for the public filesystem use cases. */
 export class ContinuationController {
   private readonly model: ContinuationModel;
 
@@ -34,22 +32,16 @@ export class ContinuationController {
   execute(raw: unknown, idempotencyKey?: string): unknown {
     const input = CommandInputSchema.parse(raw);
     const parsed = parseCommand(input);
-
-    if (parsed.kind === "help") {
-      return parsed.result;
-    }
-
+    if (parsed.kind === "help") return parsed.result;
     return this.dispatch(parsed.name, parsed.input, idempotencyKey);
   }
 
-  dispatch(name: OperationName, raw: unknown, idempotencyKey?: string): unknown {
+  dispatch(name: keyof typeof OperationSchemas, raw: unknown, idempotencyKey?: string): unknown {
     const started = Date.now();
     const sessionId = this.sessionIdFrom(raw);
     const key = idempotencyKey ?? null;
     const before = this.diagnosticState(sessionId);
-    const replay = sessionId !== null && key !== null
-      ? this.records.findReceipt(sessionId, key) !== null
-      : false;
+    const replay = sessionId !== null && key !== null && this.records.findReceipt(sessionId, key) !== null;
     try {
       const result = OperationSchemas[name].output.parse(this.dispatchValidated(name, raw, key));
       this.diagnostic(sessionId, name, key, replay ? "replay" : "result", started, before, result);
@@ -62,13 +54,17 @@ export class ContinuationController {
 
   failure(id: string, error: unknown): RpcResponse {
     const message = error instanceof Error ? error.message : String(error);
-    const code = error instanceof RepositoryError ? error.code
-      : error instanceof z.ZodError ? "validation"
-      : message.includes("schema digest") ? "unsupported_protocol" : "internal";
+    const code = error instanceof RepositoryError
+      ? error.code
+      : error instanceof z.ZodError
+        ? "validation"
+        : message.includes("schema digest")
+          ? "unsupported_protocol"
+          : "internal";
     return { protocolVersion: PROTOCOL_VERSION, id, ok: false, error: { code, message } };
   }
 
-  private dispatchValidated(name: OperationName, raw: unknown, key: string | null): unknown {
+  private dispatchValidated(name: keyof typeof OperationSchemas, raw: unknown, key: string | null): unknown {
     switch (name) {
       case "hello": return this.hello(raw);
       case "pwd": return this.pwd(raw, key);
@@ -92,7 +88,7 @@ export class ContinuationController {
   private hello(raw: unknown) {
     const input = OperationSchemas.hello.input.parse(raw);
     if (input.schemaDigest !== schemaDigest) throw new Error("schema digest mismatch");
-    return { protocolVersion: PROTOCOL_VERSION, schemaDigest, daemon: "context-tree-v3" };
+    return { protocolVersion: PROTOCOL_VERSION, schemaDigest, daemon: "context-tree-v6" };
   }
 
   private pwd(raw: unknown, key: string | null): PwdState {
@@ -103,72 +99,108 @@ export class ContinuationController {
         if (input.cwd) this.model.validateWorkspace(existing, input.cwd);
         return this.pwdState(this.model.resolveSession(input.sessionId));
       }
-      const cwd = input.cwd ?? process.cwd();
-      const resolved = this.model.createSession(input.sessionId, cwd);
-      this.records.appendJournal({ sessionId: input.sessionId, operation: "pwd", previousSnapshotId: null, nextSnapshotId: resolved.snapshot.id, cursorEntryPath: [], idempotencyKey: key, payload: {} });
-      return this.pwdState(resolved);
+      return this.pwdState(this.model.createSession(input.sessionId, input.cwd ?? process.cwd()));
     });
   }
 
   private ls(raw: unknown) {
     const input = OperationSchemas.ls.input.parse(raw);
-    const resolved = this.model.resolveSession(input.sessionId);
-    const listed = this.model.resolvePath(resolved, input.path ?? ".");
-    return { ...this.cursorState(resolved), listedPath: this.model.path(listed), entries: this.entries(listed) };
+    const live = this.model.resolveSession(input.sessionId);
+    if (input.revision === undefined) {
+      const listed = this.model.resolvePath(live, input.path ?? ".");
+      return {
+        ...this.cursorState(live),
+        listedPath: this.model.path(listed),
+        entries: this.entries(live.view, listed),
+      };
+    }
+    const view = this.model.resolveView(
+      input.sessionId,
+      input.revision,
+      input.reference,
+      input.path ?? ".",
+    );
+    return {
+      ...this.cursorState(live),
+      listedPath: this.model.path(view.node),
+      view_path: this.model.path(view.node),
+      entries: this.entries(view.selected, view.node),
+    };
   }
 
   private cd(raw: unknown, key: string | null): CursorState {
     const input = OperationSchemas.cd.input.parse(raw);
-    return this.mutation(input.sessionId, key, "cd", OperationSchemas.cd.output, (resolved) => this.model.cd(resolved, input.path));
+    return this.mutation(input.sessionId, key, "cd", OperationSchemas.cd.output, (resolved) =>
+      this.model.cd(resolved, input.path)
+    );
   }
 
   private mkdir(raw: unknown, key: string | null): CursorState {
     const input = OperationSchemas.mkdir.input.parse(raw);
-    return this.mutation(input.sessionId, key, "mkdir", OperationSchemas.mkdir.output, (resolved) => this.model.mkdir(resolved, input.name, input.work ?? {}));
+    return this.mutation(input.sessionId, key, "mkdir", OperationSchemas.mkdir.output, (resolved, revision) =>
+      this.model.mkdir(resolved, revision, input.name, input.work ?? {})
+    );
   }
 
   private edit(raw: unknown, key: string | null): CursorState {
     const input = OperationSchemas.edit.input.parse(raw);
-    return this.mutation(input.sessionId, key, "edit", OperationSchemas.edit.output, (resolved) => this.model.edit(resolved, input.patch));
+    return this.mutation(input.sessionId, key, "edit", OperationSchemas.edit.output, (resolved, revision) =>
+      this.model.edit(resolved, revision, input.patch)
+    );
   }
 
   private move(raw: unknown, key: string | null): CursorState {
     const input = OperationSchemas.mv.input.parse(raw);
-    return this.mutation(input.sessionId, key, "mv", OperationSchemas.mv.output, (resolved) => this.model.move(resolved, input.source, input.destination));
+    return this.mutation(input.sessionId, key, "mv", OperationSchemas.mv.output, (resolved, revision) =>
+      this.model.move(resolved, revision, input.source, input.destination)
+    );
   }
 
   private close(raw: unknown, key: string | null): CursorState {
     const input = OperationSchemas.close.input.parse(raw);
-    return this.mutation(input.sessionId, key, "close", OperationSchemas.close.output, (resolved) => this.model.close(resolved, input.summary, input.status));
+    return this.mutation(input.sessionId, key, "close", OperationSchemas.close.output, (resolved, revision) =>
+      this.model.close(resolved, revision, input.summary, input.status)
+    );
   }
 
   private search(raw: unknown) {
     const input = OperationSchemas.search.input.parse(raw);
     const resolved = this.model.resolveSession(input.sessionId);
-    const target = this.model.resolvePath(resolved, input.path ?? ".");
     const needle = input.query.toLocaleLowerCase();
-    const candidates = input.scope === "subtree"
-      ? this.model.allNodesBelow(target)
-      : this.searchRoots(resolved, input.scope).flatMap((root) => this.model.allNodesAt(root));
-    const matches = candidates
-      .filter((node) => this.searchable(node).includes(needle))
-      .map((node) => ({ path: this.model.path(node), name: node.names.at(-1) ?? "/", work: this.model.work(node.payload) }));
+    const matches = input.scope === "history"
+      ? this.historyMatches(input.sessionId, needle)
+      : this.currentMatches(resolved, input.scope, input.path, needle);
     return { ...this.cursorState(resolved), matches };
   }
 
   private revisionList(raw: unknown) {
     const input = OperationSchemas["rev-list"].input.parse(raw);
     const resolved = this.model.resolveSession(input.sessionId);
-    const target = this.model.resolvePath(resolved, input.path ?? ".");
-    return { ...this.cursorState(resolved), revisions: this.model.listNodeRevisions(target).map((revision) => this.revisionSummary(revision.id)) };
+    const revisions = this.model.history(input.sessionId, input.reference, input.path ?? ".")
+      .map(({ revision, changes }) => this.revisionSummary(revision, changes));
+    return { ...this.cursorState(resolved), head_revision: resolved.session.headRevision, revisions };
   }
 
   private revisionShow(raw: unknown) {
     const input = OperationSchemas["rev-show"].input.parse(raw);
     const resolved = this.model.resolveSession(input.sessionId);
-    const target = this.model.resolvePath(resolved, input.path ?? ".");
-    const revision = this.model.revisionOnLineage(target, input.revisionId);
-    return { ...this.cursorState(resolved), details: { revision: this.revisionSummary(revision.id), work: this.model.work(this.records.getPayloadRevision(revision.payloadRevisionId)), entries: this.entriesForRevision(revision.id) } };
+    const view = this.model.resolveView(
+      input.sessionId,
+      input.revision,
+      input.reference,
+      input.path ?? ".",
+    );
+    const history = this.model.history(input.sessionId, input.reference, input.path ?? ".");
+    const item = history.find((value) => value.revision.revision === input.revision);
+    return {
+      ...this.cursorState(resolved),
+      details: {
+        revision: this.revisionSummary(view.selected, item?.changes ?? []),
+        view_path: this.model.path(view.node),
+        work: this.model.work(view.node),
+        entries: this.entries(view.selected, view.node),
+      },
+    };
   }
 
   private fork(raw: unknown, key: string | null) {
@@ -176,7 +208,15 @@ export class ContinuationController {
     return this.command(input.sessionId, key, OperationSchemas.fork.output, () => {
       const before = this.model.resolveSession(input.sessionId);
       const forked = this.model.fork(before, input.newSessionId);
-      this.records.appendJournal({ sessionId: input.sessionId, operation: "fork", previousSnapshotId: before.snapshot.id, nextSnapshotId: before.snapshot.id, cursorEntryPath: before.cursor.entryPath, idempotencyKey: key, payload: { forkedSessionId: input.newSessionId } });
+      this.records.appendEvent({
+        sessionId: input.sessionId,
+        revision: null,
+        rootNodeId: null,
+        operation: "fork",
+        cursorLinkPath: before.session.cursorLinkPath,
+        idempotencyKey: key,
+        payload: { forkedSessionId: input.newSessionId },
+      });
       return { ...this.cursorState(before), forkedSessionId: forked.session.id };
     });
   }
@@ -186,16 +226,27 @@ export class ContinuationController {
     const resolved = this.model.resolveSession(input.sessionId);
     return {
       ...this.cursorState(resolved),
-      ancestry: resolved.nodes.map((node) => ({ path: this.model.path(node), work: this.model.work(node.payload), closedChildOutcomes: this.entries(node).filter((entry) => ["done", "abandoned", "superseded"].includes(entry.status)).map((entry) => entry.title || entry.name) })),
+      ancestry: resolved.nodes.map((node) => ({
+        path: this.model.path(node),
+        work: this.model.work(node),
+        closedChildOutcomes: this.entries(resolved.view, node)
+          .filter((entry) => ["done", "abandoned", "superseded"].includes(entry.status))
+          .map((entry) => entry.title || entry.name),
+      })),
       pendingProposalCount: this.records.listPendingProposals(input.sessionId).length,
-      unresolvedCount: this.model.countUnresolved(resolved),
+      unresolvedCount: this.model.allNodes(resolved)
+        .filter((node) => !["done", "abandoned", "superseded"].includes(node.record.attributes.status))
+        .length,
     };
   }
 
   private proposals(raw: unknown) {
     const input = OperationSchemas.proposals.input.parse(raw);
     const resolved = this.model.resolveSession(input.sessionId);
-    return { ...this.cursorState(resolved), proposals: this.records.listPendingProposals(input.sessionId).map((proposal) => this.proposal(proposal)) };
+    return {
+      ...this.cursorState(resolved),
+      proposals: this.records.listPendingProposals(input.sessionId).map((proposal) => this.proposal(proposal)),
+    };
   }
 
   private decideProposal(raw: unknown, key: string | null) {
@@ -203,15 +254,12 @@ export class ContinuationController {
     return this.command(input.sessionId, key, OperationSchemas["decide-proposal"].output, () => {
       const resolved = this.model.resolveSession(input.sessionId);
       const proposal = this.records.getPendingProposal(input.proposalId, input.sessionId);
-      const decision = this.model.decideProposal(resolved, proposal, input.decision, input.replacement ?? null);
+      const revision = resolved.session.headRevision + 1;
+      const decision = this.model.decideProposal(resolved, revision, proposal, input.decision, input.replacement ?? null);
       this.records.updateProposalStatus(proposal.id, decision.status);
-      const next = decision.kind === "unchanged"
-        ? resolved
-        : this.persistMutation(resolved, "decide-proposal", key, {
-          rootNodeRevisionId: decision.rootNodeRevisionId,
-          cursorEntryPath: decision.cursorEntryPath,
-        });
-      if (decision.kind === "unchanged") this.records.appendJournal({ sessionId: input.sessionId, operation: "decide-proposal", previousSnapshotId: resolved.snapshot.id, nextSnapshotId: resolved.snapshot.id, cursorEntryPath: resolved.cursor.entryPath, idempotencyKey: key, payload: { proposalId: proposal.id, status: decision.status } });
+      const next = decision.kind === "state"
+        ? this.persistMutation(resolved, "decide-proposal", key, decision.cursorLinkPath)
+        : this.persistCursorOnly(resolved, "decide-proposal", key, decision.cursorLinkPath);
       return { ...this.cursorState(next), proposalId: proposal.id, status: decision.status };
     });
   }
@@ -221,7 +269,15 @@ export class ContinuationController {
     return this.command(input.sessionId, key, OperationSchemas["submit-proposal"].output, () => {
       const resolved = this.model.resolveSession(input.sessionId);
       const proposal = this.model.createProposal(resolved, input.kind, input.patch ?? null, input.sourceSessionId ?? null);
-      this.records.appendJournal({ sessionId: input.sessionId, operation: "submit-proposal", previousSnapshotId: resolved.snapshot.id, nextSnapshotId: resolved.snapshot.id, cursorEntryPath: resolved.cursor.entryPath, idempotencyKey: key, payload: { proposalId: proposal.id } });
+      this.records.appendEvent({
+        sessionId: input.sessionId,
+        revision: null,
+        rootNodeId: null,
+        operation: "submit-proposal",
+        cursorLinkPath: resolved.session.cursorLinkPath,
+        idempotencyKey: key,
+        payload: { proposalId: proposal.id },
+      });
       return this.proposal(proposal);
     });
   }
@@ -230,102 +286,157 @@ export class ContinuationController {
     sessionId: string,
     key: string | null,
     operation: string,
-    resultSchema: z.ZodType<T>,
-    change: (resolved: ResolvedSession) => Mutation,
+    schema: z.ZodType<T>,
+    change: (resolved: ResolvedSession, revision: number) => StateMutation,
   ): T {
-    return this.command(sessionId, key, resultSchema, () => {
+    return this.command(sessionId, key, schema, () => {
       const resolved = this.model.resolveSession(sessionId);
-      return resultSchema.parse(
-        this.cursorState(this.persistMutation(resolved, operation, key, change(resolved))),
-      );
+      const revision = resolved.session.headRevision + 1;
+      const mutation = change(resolved, revision);
+      const next = mutation.changed
+        ? this.persistMutation(resolved, operation, key, mutation.cursorLinkPath)
+        : this.persistCursorOnly(resolved, operation, key, mutation.cursorLinkPath);
+      return schema.parse(this.cursorState(next));
     });
   }
 
-  private command<T>(
-    sessionId: string,
-    key: string | null,
-    resultSchema: z.ZodType<T>,
-    work: () => T,
-  ): T {
+  private command<T>(sessionId: string, key: string | null, schema: z.ZodType<T>, work: () => T): T {
     return this.records.transaction(() => {
       if (key !== null) {
-        const replay = this.records.findReceipt(sessionId, key);
-        if (replay !== null) return resultSchema.parse(replay);
+        const receipt = this.records.findReceipt(sessionId, key);
+        if (receipt !== null) return schema.parse(receipt);
       }
-      const result = resultSchema.parse(work());
+      const result = schema.parse(work());
       if (key !== null) this.records.saveReceipt(sessionId, key, result);
       return result;
     });
   }
 
-  private persistMutation(resolved: ResolvedSession, operation: string, key: string | null, mutation: Mutation): ResolvedSession {
-    const changed = mutation.rootNodeRevisionId !== resolved.snapshot.rootNodeRevisionId;
-    const snapshot = changed ? this.records.insertSnapshot(mutation.rootNodeRevisionId, resolved.snapshot.id) : resolved.snapshot;
-    if (changed) this.records.updateSessionHead(resolved.session.id, snapshot.id);
-    this.records.saveCursor({ sessionId: resolved.session.id, snapshotId: snapshot.id, entryPath: mutation.cursorEntryPath, updatedAt: new Date().toISOString() });
-    this.records.appendJournal({ sessionId: resolved.session.id, operation, previousSnapshotId: resolved.snapshot.id, nextSnapshotId: snapshot.id, cursorEntryPath: mutation.cursorEntryPath, idempotencyKey: key, payload: {} });
+  private persistMutation(
+    resolved: ResolvedSession,
+    operation: string,
+    key: string | null,
+    cursorLinkPath: Id[],
+  ): ResolvedSession {
+    const revision = resolved.session.headRevision + 1;
+    this.records.updateSessionHead(resolved.session.id, revision, cursorLinkPath);
+    this.records.appendEvent({
+      sessionId: resolved.session.id,
+      revision,
+      rootNodeId: resolved.view.rootNodeId,
+      operation,
+      cursorLinkPath,
+      idempotencyKey: key,
+      payload: {},
+    });
     return this.model.resolveSession(resolved.session.id);
+  }
+
+  private persistCursorOnly(
+    resolved: ResolvedSession,
+    operation: string,
+    key: string | null,
+    cursorLinkPath: Id[],
+  ): ResolvedSession {
+    this.records.updateSessionCursor(resolved.session.id, cursorLinkPath);
+    this.records.appendEvent({
+      sessionId: resolved.session.id,
+      revision: null,
+      rootNodeId: null,
+      operation,
+      cursorLinkPath,
+      idempotencyKey: key,
+      payload: {},
+    });
+    return this.model.resolveSession(resolved.session.id);
+  }
+
+  private currentMatches(
+    resolved: ResolvedSession,
+    scope: "subtree" | "session" | "workspace" | "global",
+    path: string | undefined,
+    needle: string,
+  ): SearchMatch[] {
+    const nodes = scope === "subtree"
+      ? this.model.allNodesBelow(resolved, this.model.resolvePath(resolved, path ?? "."))
+      : scope === "session"
+        ? this.model.allNodes(resolved)
+        : this.records.listSessions(scope === "workspace" ? resolved.session.workspacePath : null)
+          .flatMap((session) => this.model.allNodesAtView(
+            this.records.getSessionRevision(session.id, session.headRevision),
+          ));
+    return nodes
+      .filter((node) => this.searchable(node).includes(needle))
+      .map((node) => this.searchMatch(node));
+  }
+
+  private historyMatches(sessionId: string, needle: string): SearchMatch[] {
+    return this.records.listSessionRevisions(sessionId).flatMap((revision) => {
+      return this.model.allNodesAtView(revision)
+        .filter((node) => this.searchable(node).includes(needle))
+        .map((node) => ({ ...this.searchMatch(node), revision: revision.revision }));
+    });
   }
 
   private cursorState(resolved: ResolvedSession): CursorState {
     const current = this.model.current(resolved);
-    const current_dir: CurrentDirectory = { path: this.model.path(current), canGoBack: current.entryPath.length > 0 };
+    const current_dir: CurrentDirectory = {
+      path: this.model.path(current),
+      canGoBack: current.linkPath.length > 0,
+    };
     return { current_dir };
   }
 
   private pwdState(resolved: ResolvedSession): PwdState {
-    const current = this.model.current(resolved);
+    return { ...this.cursorState(resolved), current_work: this.model.work(this.model.current(resolved)) };
+  }
+
+  private entries(view: View, node: ResolvedNode): EntrySummary[] {
+    return this.model.entries(view, node).map(({ name, child }) => ({
+      name,
+      kind: child.record.attributes.kind,
+      title: child.record.attributes.title,
+      status: child.record.attributes.status,
+      hasChildren: this.model.entries(view, child).length > 0,
+    }));
+  }
+
+  private revisionSummary(
+    revision: SessionRevision,
+    changes: RevisionSummary["changes"],
+  ): RevisionSummary {
+    return { revision: revision.revision, createdAt: revision.createdAt, changes };
+  }
+
+  private proposal(proposal: Proposal): ProposalSummary {
     return {
-      ...this.cursorState(resolved),
-      current_work: this.model.work(current.payload),
+      proposalId: proposal.id,
+      kind: proposal.kind,
+      status: proposal.status,
+      createdAt: proposal.createdAt,
+      sourceSessionId: proposal.sourceSessionId,
+      patch: proposal.patch,
     };
   }
 
-  private entries(node: ResolvedNode): EntrySummary[] {
-    return this.model.entrySummaries(node).map(({ name, child }) => ({ name, kind: child.payload.kind, title: child.payload.title, status: child.payload.status, hasChildren: child.memberships.length > 0 }));
-  }
-
-
-  private entriesForRevision(revisionId: Id): EntrySummary[] {
-    const revision = this.records.getNodeRevision(revisionId);
-    const directory = this.records.getDirectoryRevision(revision.directoryRevisionId);
-    return this.records.listMemberships(directory.id).map((membership) => {
-      const entry = this.records.getEntryRevision(membership.entryRevisionId);
-      const child = this.records.getNodeRevision(membership.childNodeRevisionId);
-      const work = this.records.getPayloadRevision(child.payloadRevisionId);
-      return { name: entry.name, kind: work.kind, title: work.title, status: work.status, hasChildren: this.records.listMemberships(child.directoryRevisionId).length > 0 };
-    });
-  }
-
-  private revisionSummary(revisionId: Id): NodeRevisionSummary {
-    const revision = this.records.getNodeRevision(revisionId);
-    return { revisionId: revision.id, createdAt: revision.createdAt, changes: this.model.changes(revision) };
-  }
-
-  private proposal(proposal: { id: Id; kind: ProposalSummary["kind"]; status: ProposalSummary["status"]; createdAt: string; sourceSessionId: string | null; patch: WorkPatch | null }): ProposalSummary {
-    return { proposalId: proposal.id, kind: proposal.kind, status: proposal.status, createdAt: proposal.createdAt, sourceSessionId: proposal.sourceSessionId, patch: proposal.patch };
+  private searchMatch(node: ResolvedNode): SearchMatch {
+    return {
+      path: this.model.path(node),
+      name: node.names.at(-1) ?? "/",
+      work: this.model.work(node),
+    };
   }
 
   private searchable(node: ResolvedNode): string {
-    const work = this.model.work(node.payload);
-    return [this.model.path(node), work.kind, work.title, work.objective, work.rationale, work.currentState].join("\n").toLocaleLowerCase();
-  }
-
-  private searchRoots(resolved: ResolvedSession, scope: "subtree" | "session" | "workspace" | "global" | "history"): Id[] {
-    switch (scope) {
-      case "subtree": return [this.model.current(resolved).nodeRevision.id];
-      case "session": return [resolved.snapshot.rootNodeRevisionId];
-      case "workspace": return this.records.listSessionHeadSnapshotIds(resolved.session.workspaceId)
-        .map((snapshotId) => this.records.getSnapshot(snapshotId).rootNodeRevisionId);
-      case "global": return this.records.listSessionHeadSnapshotIds(null)
-        .map((snapshotId) => this.records.getSnapshot(snapshotId).rootNodeRevisionId);
-      case "history": return this.records.listHistoricalSnapshotRootRevisionIds(null);
-    }
+    const work = this.model.work(node);
+    return [this.model.path(node), work.kind, work.title, work.objective, work.rationale, work.currentState]
+      .join("\n")
+      .toLocaleLowerCase();
   }
 
   private sessionIdFrom(raw: unknown): string | null {
-    const parsed = z.object({ sessionId: z.string() }).passthrough().safeParse(raw);
-    return parsed.success ? parsed.data.sessionId : null;
+    const value = z.object({ sessionId: z.string() }).passthrough().safeParse(raw);
+    return value.success ? value.data.sessionId : null;
   }
 
   private diagnostic(
@@ -334,7 +445,7 @@ export class ContinuationController {
     idempotencyKey: string | null,
     outcome: "result" | "replay" | "error",
     started: number,
-    before: { headSnapshotId: Id | null; cursorDepth: number | null; currentNodeRevisionId: Id | null },
+    before: DiagnosticState,
     result: unknown | null,
     error: unknown | null = null,
   ): void {
@@ -345,59 +456,54 @@ export class ContinuationController {
       idempotencyKey,
       outcome,
       durationMs: Date.now() - started,
-      beforeSnapshotId: before.headSnapshotId,
-      afterSnapshotId: after.headSnapshotId,
-      beforeNodeRevisionId: before.currentNodeRevisionId,
-      afterNodeRevisionId: after.currentNodeRevisionId,
+      beforeRootNodeId: before.rootNodeId,
+      afterRootNodeId: after.rootNodeId,
+      beforeRecordId: before.currentRecordId,
+      afterRecordId: after.currentRecordId,
+      beforeRevision: before.revision,
+      afterRevision: after.revision,
       cursorDepthBefore: before.cursorDepth,
       cursorDepthAfter: after.cursorDepth,
       ...(error ? { error: error instanceof Error ? error.message : String(error) } : {}),
     };
-    if (process.env.CONTEXT_TREE_DEBUG_CONTEXT === "1") {
-      writeDiagnostic({ ...base, result });
-      return;
-    }
-    writeDiagnostic(base);
+    writeDiagnostic(process.env.CONTEXT_TREE_DEBUG_CONTEXT === "1" ? { ...base, result } : base);
   }
 
-  private diagnosticState(sessionId: string | null): {
-    headSnapshotId: Id | null;
-    cursorDepth: number | null;
-    currentNodeRevisionId: Id | null;
-  } {
-    if (sessionId === null) return this.emptyDiagnosticState();
+  private diagnosticState(sessionId: string | null): DiagnosticState {
+    if (sessionId === null) {
+      return { rootNodeId: null, revision: null, cursorDepth: null, currentRecordId: null };
+    }
     const session = this.records.findSession(sessionId);
-    if (!session) return this.emptyDiagnosticState();
+    if (!session) {
+      return { rootNodeId: null, revision: null, cursorDepth: null, currentRecordId: null };
+    }
     try {
       const resolved = this.model.resolveSession(sessionId);
       return {
-        headSnapshotId: session.headSnapshotId,
-        cursorDepth: resolved.cursor.entryPath.length,
-        currentNodeRevisionId: this.model.current(resolved).nodeRevision.id,
+        rootNodeId: session.rootNodeId,
+        revision: session.headRevision,
+        cursorDepth: resolved.session.cursorLinkPath.length,
+        currentRecordId: this.model.current(resolved).record.id,
       };
     } catch {
       return {
-        headSnapshotId: session.headSnapshotId,
+        rootNodeId: session.rootNodeId,
+        revision: session.headRevision,
         cursorDepth: null,
-        currentNodeRevisionId: null,
+        currentRecordId: null,
       };
     }
   }
-
-  private emptyDiagnosticState(): {
-    headSnapshotId: null;
-    cursorDepth: null;
-    currentNodeRevisionId: null;
-  } {
-    return { headSnapshotId: null, cursorDepth: null, currentNodeRevisionId: null };
-  }
 }
 
-/**
- * Transport-facing filesystem facade. It intentionally exposes no repository,
- * snapshot, or model API: daemon, MCP, hook, and shell adapters see only this
- * cursor-relative operation surface.
- */
+type DiagnosticState = {
+  rootNodeId: Id | null;
+  revision: number | null;
+  cursorDepth: number | null;
+  currentRecordId: Id | null;
+};
+
+/** Transport-facing adapter boundary; it exposes no model or persistence API. */
 export class FilesystemOperations {
   constructor(private readonly controller = new ContinuationController()) {}
 

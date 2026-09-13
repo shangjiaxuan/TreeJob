@@ -4,94 +4,50 @@ export type SqlTable = {
   indexes?: readonly string[];
 };
 
+/**
+ * v6 separates node work history from link/topology history. A session
+ * revision is the immutable view coordinate; there is no snapshot overlay.
+ */
 export const tables: readonly SqlTable[] = [
   {
-    name: "workspaces_v3",
-    create: "CREATE TABLE IF NOT EXISTS workspaces_v3(" +
-      "id INTEGER PRIMARY KEY AUTOINCREMENT, canonical_path TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL)",
+    name: "nodes_v6",
+    create: "CREATE TABLE IF NOT EXISTS nodes_v6(id INTEGER PRIMARY KEY AUTOINCREMENT,created_session_id TEXT NOT NULL,created_revision INTEGER NOT NULL,created_at TEXT NOT NULL)",
   },
   {
-    name: "nodes_v3",
-    create: "CREATE TABLE IF NOT EXISTS nodes_v3(" +
-      "id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL)",
+    name: "links_v6",
+    create: "CREATE TABLE IF NOT EXISTS links_v6(id INTEGER PRIMARY KEY AUTOINCREMENT,child_node_id INTEGER NOT NULL,created_session_id TEXT NOT NULL,created_revision INTEGER NOT NULL,created_at TEXT NOT NULL)",
+    indexes: ["CREATE INDEX IF NOT EXISTS link_child_v6 ON links_v6(child_node_id)"],
   },
   {
-    name: "payload_revisions_v3",
-    create: "CREATE TABLE IF NOT EXISTS payload_revisions_v3(" +
-      "id INTEGER PRIMARY KEY AUTOINCREMENT, node_id INTEGER NOT NULL, predecessor_id INTEGER, version INTEGER NOT NULL, " +
-      "kind TEXT NOT NULL, title TEXT NOT NULL, objective TEXT NOT NULL, rationale TEXT NOT NULL, current_state TEXT NOT NULL, " +
-      "open_questions_json TEXT NOT NULL, return_condition TEXT NOT NULL, refs_json TEXT NOT NULL, metadata_json TEXT NOT NULL, " +
-      "status TEXT NOT NULL, created_at TEXT NOT NULL)",
-    indexes: ["CREATE INDEX IF NOT EXISTS payload_node_v3 ON payload_revisions_v3(node_id, version)"],
+    name: "node_records_v6",
+    create: "CREATE TABLE IF NOT EXISTS node_records_v6(id INTEGER PRIMARY KEY AUTOINCREMENT,node_id INTEGER NOT NULL,session_id TEXT NOT NULL,revision INTEGER NOT NULL,work_json TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(node_id,session_id,revision))",
+    indexes: ["CREATE INDEX IF NOT EXISTS node_view_v6 ON node_records_v6(node_id,session_id,revision DESC)"],
   },
   {
-    name: "directory_revisions_v3",
-    create: "CREATE TABLE IF NOT EXISTS directory_revisions_v3(" +
-      "id INTEGER PRIMARY KEY AUTOINCREMENT, node_id INTEGER NOT NULL, predecessor_id INTEGER, version INTEGER NOT NULL, created_at TEXT NOT NULL)",
-    indexes: ["CREATE INDEX IF NOT EXISTS directory_node_v3 ON directory_revisions_v3(node_id, version)"],
-  },
-  {
-    name: "entries_v3",
-    create: "CREATE TABLE IF NOT EXISTS entries_v3(" +
-      "id INTEGER PRIMARY KEY AUTOINCREMENT, node_id INTEGER NOT NULL, created_at TEXT NOT NULL)",
-  },
-  {
-    name: "entry_revisions_v3",
-    create: "CREATE TABLE IF NOT EXISTS entry_revisions_v3(" +
-      "id INTEGER PRIMARY KEY AUTOINCREMENT, entry_id INTEGER NOT NULL, predecessor_id INTEGER, version INTEGER NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL)",
-    indexes: ["CREATE INDEX IF NOT EXISTS entry_revision_entry_v3 ON entry_revisions_v3(entry_id, version)"],
-  },
-  {
-    name: "node_revisions_v3",
-    create: "CREATE TABLE IF NOT EXISTS node_revisions_v3(" +
-      "id INTEGER PRIMARY KEY AUTOINCREMENT, node_id INTEGER NOT NULL, predecessor_id INTEGER, payload_revision_id INTEGER NOT NULL, " +
-      "directory_revision_id INTEGER NOT NULL, created_at TEXT NOT NULL)",
-    indexes: ["CREATE INDEX IF NOT EXISTS node_revision_node_v3 ON node_revisions_v3(node_id, id)"],
-  },
-  {
-    name: "directory_memberships_v3",
-    create: "CREATE TABLE IF NOT EXISTS directory_memberships_v3(" +
-      "directory_revision_id INTEGER NOT NULL, position INTEGER NOT NULL, entry_revision_id INTEGER NOT NULL, child_node_revision_id INTEGER NOT NULL, " +
-      "PRIMARY KEY(directory_revision_id, position))",
+    name: "link_records_v6",
+    create: "CREATE TABLE IF NOT EXISTS link_records_v6(id INTEGER PRIMARY KEY AUTOINCREMENT,link_id INTEGER NOT NULL,session_id TEXT NOT NULL,revision INTEGER NOT NULL,parent_node_id INTEGER NOT NULL,name TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(link_id,session_id,revision))",
     indexes: [
-      "CREATE UNIQUE INDEX IF NOT EXISTS directory_entry_identity_v3 ON directory_memberships_v3(directory_revision_id, entry_revision_id)",
-      "CREATE INDEX IF NOT EXISTS directory_member_entry_v3 ON directory_memberships_v3(entry_revision_id)",
+      "CREATE INDEX IF NOT EXISTS link_view_v6 ON link_records_v6(link_id,session_id,revision DESC)",
+      "CREATE INDEX IF NOT EXISTS link_parent_v6 ON link_records_v6(parent_node_id,session_id,revision DESC)",
     ],
   },
   {
-    name: "snapshots_v3",
-    create: "CREATE TABLE IF NOT EXISTS snapshots_v3(" +
-      "id INTEGER PRIMARY KEY AUTOINCREMENT, root_node_revision_id INTEGER NOT NULL, parent_snapshot_id INTEGER, created_at TEXT NOT NULL)",
+    name: "sessions_v6",
+    create: "CREATE TABLE IF NOT EXISTS sessions_v6(id TEXT PRIMARY KEY,workspace_path TEXT NOT NULL,root_node_id INTEGER NOT NULL,head_revision INTEGER NOT NULL,cursor_link_path_json TEXT NOT NULL,parent_session_id TEXT,parent_session_revision INTEGER,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)",
+    indexes: ["CREATE INDEX IF NOT EXISTS session_workspace_v6 ON sessions_v6(workspace_path)"],
   },
   {
-    name: "sessions_v3",
-    create: "CREATE TABLE IF NOT EXISTS sessions_v3(" +
-      "id TEXT PRIMARY KEY, workspace_id INTEGER NOT NULL, head_snapshot_id INTEGER NOT NULL, parent_session_id TEXT, created_at TEXT NOT NULL)",
+    name: "session_events_v6",
+    create: "CREATE TABLE IF NOT EXISTS session_events_v6(sequence INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL,revision INTEGER,root_node_id INTEGER,operation TEXT NOT NULL,cursor_link_path_json TEXT NOT NULL,idempotency_key TEXT,payload_json TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(session_id,revision))",
+    indexes: ["CREATE INDEX IF NOT EXISTS event_session_v6 ON session_events_v6(session_id,sequence)"],
   },
   {
-    name: "cursors_v3",
-    create: "CREATE TABLE IF NOT EXISTS cursors_v3(" +
-      "session_id TEXT PRIMARY KEY, snapshot_id INTEGER NOT NULL, entry_path_json TEXT NOT NULL, updated_at TEXT NOT NULL)",
+    name: "proposals_v6",
+    create: "CREATE TABLE IF NOT EXISTS proposals_v6(id INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL,source_session_id TEXT,source_revision INTEGER NOT NULL,target_node_id INTEGER NOT NULL,base_record_id INTEGER NOT NULL,patch_json TEXT,kind TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,decided_at TEXT)",
   },
   {
-    name: "proposals_v3",
-    create: "CREATE TABLE IF NOT EXISTS proposals_v3(" +
-      "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, source_session_id TEXT, source_snapshot_id INTEGER NOT NULL, " +
-      "target_node_id INTEGER NOT NULL, target_node_revision_id INTEGER NOT NULL, patch_json TEXT, kind TEXT NOT NULL, status TEXT NOT NULL, " +
-      "created_at TEXT NOT NULL, decided_at TEXT)",
-  },
-  {
-    name: "journal_v3",
-    create: "CREATE TABLE IF NOT EXISTS journal_v3(" +
-      "sequence INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, operation TEXT NOT NULL, previous_snapshot_id INTEGER, " +
-      "next_snapshot_id INTEGER, cursor_entry_path_json TEXT NOT NULL, idempotency_key TEXT, payload_json TEXT NOT NULL, created_at TEXT NOT NULL)",
-    indexes: ["CREATE INDEX IF NOT EXISTS journal_session_v3 ON journal_v3(session_id, sequence)"],
-  },
-  {
-    name: "receipts_v3",
-    create: "CREATE TABLE IF NOT EXISTS receipts_v3(" +
-      "session_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, result_json TEXT NOT NULL, created_at TEXT NOT NULL, " +
-      "PRIMARY KEY(session_id, idempotency_key))",
+    name: "receipts_v6",
+    create: "CREATE TABLE IF NOT EXISTS receipts_v6(session_id TEXT NOT NULL,idempotency_key TEXT NOT NULL,result_json TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(session_id,idempotency_key))",
   },
 ];
 
@@ -101,6 +57,6 @@ export function migrationSql(): string[] {
     "PRAGMA foreign_keys=ON",
     "PRAGMA busy_timeout=5000",
     ...tables.flatMap((table) => [table.create, ...(table.indexes ?? [])]),
-    "PRAGMA user_version=3",
+    "PRAGMA user_version=6",
   ];
 }

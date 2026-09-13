@@ -22,13 +22,15 @@ import type {
   ListResult,
   MkdirInput,
   MoveInput,
-  NodeRevisionSummary,
+  RevisionSummary,
   OperationContracts,
   OperationName,
   ProposalDecision,
   ProposalKind,
   ProposalStatus,
   PathInput,
+  ListInput,
+  RevisionListInput,
   ProposalDecisionResult,
   ProposalListResult,
   ProposalSummary,
@@ -36,6 +38,7 @@ import type {
   PwdState,
   RecordStatus,
   Reference,
+  Revision,
   RevisionDetails,
   RevisionListResult,
   RevisionShowInput,
@@ -46,6 +49,7 @@ import type {
   RpcResponse,
   RpcSuccess,
   SearchInput,
+  SearchMatch,
   SearchScope,
   SearchResult,
   SessionInput,
@@ -57,7 +61,7 @@ import type {
 import { contractMetadata } from "./generated/contracts-metadata.js";
 import { ContractRuntime } from "./schema-runtime.js";
 
-export const PROTOCOL_VERSION = 3 as const;
+export const PROTOCOL_VERSION = 4 as const;
 
 const runtime = new ContractRuntime(contractMetadata);
 
@@ -66,6 +70,7 @@ function typedSchema<T>(name: string): z.ZodType<T> {
 }
 
 export const IdSchema = typedSchema<Id>("Id");
+export const RevisionSchema = typedSchema<Revision>("Revision");
 export const TimestampSchema = typedSchema<Timestamp>("Timestamp");
 export const JsonSchema = typedSchema<JsonValue>("JsonValue");
 export const CommandInputSchema = typedSchema<CommandInput>("CommandInput");
@@ -109,12 +114,14 @@ export type {
   ListResult,
   MkdirInput,
   MoveInput,
-  NodeRevisionSummary,
+  RevisionSummary,
   OperationName,
   ProposalDecision,
   ProposalKind,
   ProposalStatus,
   PathInput,
+  ListInput,
+  RevisionListInput,
   ProposalDecisionResult,
   ProposalListResult,
   ProposalSummary,
@@ -122,6 +129,7 @@ export type {
   PwdState,
   RecordStatus,
   Reference,
+  Revision,
   RevisionDetails,
   RevisionListResult,
   RevisionShowInput,
@@ -132,6 +140,7 @@ export type {
   RpcResponse,
   RpcSuccess,
   SearchInput,
+  SearchMatch,
   SearchScope,
   SearchResult,
   SessionInput,

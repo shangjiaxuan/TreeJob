@@ -8,440 +8,334 @@ import {
   JsonSchema,
   ProposalKindSchema,
   ProposalStatusSchema,
-  ReferenceSchema,
-  StatusSchema,
   WorkFieldsSchema,
   WorkPatchSchema,
   type Id,
   type JsonValue,
   type ProposalKind,
   type ProposalStatus,
-  type RecordStatus,
-  type Reference,
   type WorkFields,
   type WorkPatch,
 } from "./schema.js";
 import { migrationSql } from "./tables.js";
 
-export type Workspace = { id: Id; canonicalPath: string; createdAt: string };
-export type Session = {
-  id: string;
-  workspaceId: Id;
-  headSnapshotId: Id;
-  parentSessionId: string | null;
-  createdAt: string;
-};
-export type Cursor = {
+export type View = { sessionId: string; revision: number; rootNodeId: Id };
+export type NodeRecord = {
+  id: Id;
+  nodeId: Id;
   sessionId: string;
-  snapshotId: Id;
-  entryPath: Id[];
-  updatedAt: string;
-};
-export type NodeRevision = {
-  id: Id;
-  nodeId: Id;
-  predecessorId: Id | null;
-  payloadRevisionId: Id;
-  directoryRevisionId: Id;
+  revision: number;
+  attributes: WorkFields;
   createdAt: string;
 };
-export type PayloadRevision = WorkFields & {
+export type Link = {
   id: Id;
-  nodeId: Id;
-  predecessorId: Id | null;
-  version: number;
+  childNodeId: Id;
+  createdSessionId: string;
+  createdRevision: number;
   createdAt: string;
 };
-export type DirectoryRevision = {
+export type LinkRecord = {
   id: Id;
-  nodeId: Id;
-  predecessorId: Id | null;
-  version: number;
-  createdAt: string;
-};
-export type EntryRevision = {
-  id: Id;
-  entryId: Id;
-  predecessorId: Id | null;
-  version: number;
+  linkId: Id;
+  sessionId: string;
+  revision: number;
+  parentNodeId: Id;
   name: string;
   createdAt: string;
 };
-export type Membership = {
-  position: number;
-  entryRevisionId: Id;
-  childNodeRevisionId: Id;
-};
-export type Snapshot = {
-  id: Id;
-  rootNodeRevisionId: Id;
-  parentSnapshotId: Id | null;
+export type EffectiveLink = LinkRecord & { childNodeId: Id };
+export type Session = {
+  id: string;
+  workspacePath: string;
+  rootNodeId: Id;
+  headRevision: number;
+  cursorLinkPath: Id[];
+  parentSessionId: string | null;
+  parentSessionRevision: number | null;
   createdAt: string;
+  updatedAt: string;
 };
+export type SessionRevision = View & { createdAt: string };
 export type Proposal = {
   id: Id;
   sessionId: string;
   sourceSessionId: string | null;
-  sourceSnapshotId: Id;
+  sourceRevision: number;
   targetNodeId: Id;
-  targetNodeRevisionId: Id;
+  baseRecordId: Id;
   patch: WorkPatch | null;
   kind: ProposalKind;
   status: ProposalStatus;
   createdAt: string;
   decidedAt: string | null;
 };
-
 export type NewProposal = Omit<Proposal, "id">;
-export type JournalEntry = {
+export type SessionEvent = {
   sessionId: string;
+  revision: number | null;
+  rootNodeId: Id | null;
   operation: string;
-  previousSnapshotId: Id | null;
-  nextSnapshotId: Id | null;
-  cursorEntryPath: Id[];
+  cursorLinkPath: Id[];
   idempotencyKey: string | null;
   payload: JsonValue;
 };
 
+const RowSchema = z.record(z.string(), z.unknown());
+type Row = z.infer<typeof RowSchema>;
+type SqlValue = string | number | null;
+
 export class RepositoryError extends Error {
-  constructor(
-    readonly code: "not_found" | "conflict" | "invariant",
-    message: string,
-  ) {
+  constructor(readonly code: "not_found" | "conflict" | "invariant", message: string) {
     super(message);
   }
 }
 
-type SqlValue = string | number | null;
-const RowSchema = z.record(z.string(), z.unknown());
-type Row = z.infer<typeof RowSchema>;
-
 export interface RecordRepository {
   transaction<T>(work: () => T): T;
-  findWorkspace(canonicalPath: string): Workspace | null;
-  insertWorkspace(canonicalPath: string): Workspace;
-  getWorkspace(id: Id): Workspace;
-  getSession(id: string): Session;
   findSession(id: string): Session | null;
+  getSession(id: string): Session;
   insertSession(session: Session): void;
-  updateSessionHead(sessionId: string, snapshotId: Id): void;
-  getCursor(sessionId: string): Cursor;
-  saveCursor(cursor: Cursor): void;
-  createNode(): Id;
-  createEntry(nodeId: Id): Id;
-  getPayloadRevision(id: Id): PayloadRevision;
-  insertPayloadRevision(
-    nodeId: Id,
-    predecessor: PayloadRevision | null,
-    fields: WorkFields,
-  ): PayloadRevision;
-  getDirectoryRevision(id: Id): DirectoryRevision;
-  insertDirectoryRevision(
-    nodeId: Id,
-    predecessor: DirectoryRevision | null,
-    memberships: Membership[],
-  ): DirectoryRevision;
-  listMemberships(directoryRevisionId: Id): Membership[];
-  getEntryRevision(id: Id): EntryRevision;
-  insertEntryRevision(
-    entryId: Id,
-    predecessor: EntryRevision | null,
-    name: string,
-  ): EntryRevision;
-  getNodeRevision(id: Id): NodeRevision;
-  insertNodeRevision(
-    nodeId: Id,
-    predecessor: NodeRevision | null,
-    payloadRevisionId: Id,
-    directoryRevisionId: Id,
-  ): NodeRevision;
-  getSnapshot(id: Id): Snapshot;
-  insertSnapshot(rootNodeRevisionId: Id, parentSnapshotId: Id | null): Snapshot;
+  updateSessionHead(sessionId: string, revision: number, cursorLinkPath: Id[]): void;
+  updateSessionCursor(sessionId: string, cursorLinkPath: Id[]): void;
+  listSessions(workspacePath: string | null): Session[];
+  createNode(sessionId: string, revision: number): Id;
+  createLink(childNodeId: Id, sessionId: string, revision: number): Link;
+  getLink(id: Id): Link;
+  insertNodeRecord(nodeId: Id, sessionId: string, revision: number, attributes: WorkFields): NodeRecord;
+  resolveNodeRecord(nodeId: Id, view: View): NodeRecord;
+  nextNodeRecord(nodeId: Id, sessionId: string, revision: number): NodeRecord | null;
+  insertLinkRecord(linkId: Id, sessionId: string, revision: number, parentNodeId: Id, name: string): LinkRecord;
+  resolveLinkRecord(linkId: Id, view: View): LinkRecord;
+  nextLinkRecord(linkId: Id, sessionId: string, revision: number): LinkRecord | null;
+  listEffectiveLinks(parentNodeId: Id, view: View): EffectiveLink[];
+  getSessionRevision(sessionId: string, revision: number): SessionRevision;
+  listSessionRevisions(sessionId: string): SessionRevision[];
+  appendEvent(event: SessionEvent): void;
   insertProposal(proposal: NewProposal): Proposal;
   listPendingProposals(sessionId: string): Proposal[];
   getPendingProposal(id: Id, sessionId: string): Proposal;
   updateProposalStatus(id: Id, status: ProposalStatus): void;
   findReceipt(sessionId: string, key: string): JsonValue | null;
   saveReceipt(sessionId: string, key: string, result: unknown): void;
-  appendJournal(entry: JournalEntry): void;
-  listSessionHeadSnapshotIds(workspaceId: Id | null): Id[];
-  listHistoricalSnapshotRootRevisionIds(workspaceId: Id | null): Id[];
 }
 
 export class SqliteRecordRepository implements RecordRepository {
   private readonly db: DatabaseSync;
 
-  constructor(file = dataDir() + "/context-tree-v3.sqlite") {
+  constructor(file = dataDir() + "/context-tree-v6.sqlite") {
     mkdirSync(dirname(file), { recursive: true });
     this.db = new DatabaseSync(file);
-
-    for (const statement of migrationSql()) {
-      this.db.exec(statement);
-    }
+    for (const statement of migrationSql()) this.db.exec(statement);
   }
 
   transaction<T>(work: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");
-
     try {
-      const result = work();
+      const value = work();
       this.db.exec("COMMIT");
-      return result;
+      return value;
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
     }
   }
 
-  findWorkspace(canonicalPath: string): Workspace | null {
-    const row = this.one("SELECT * FROM workspaces_v3 WHERE canonical_path=?", canonicalPath);
-    return row ? this.workspace(row) : null;
-  }
-
-  insertWorkspace(canonicalPath: string): Workspace {
-    const id = this.insert(
-      "INSERT INTO workspaces_v3(canonical_path,created_at) VALUES(?,?)",
-      canonicalPath,
-      this.timestamp(),
-    );
-    return this.getWorkspace(id);
-  }
-
-  getWorkspace(id: Id): Workspace {
-    const row = this.one("SELECT * FROM workspaces_v3 WHERE id=?", id);
-    if (!row) throw new RepositoryError("not_found", "workspace not found");
-    return this.workspace(row);
+  findSession(id: string): Session | null {
+    const row = this.one("SELECT * FROM sessions_v6 WHERE id=?", id);
+    return row === null ? null : this.session(row);
   }
 
   getSession(id: string): Session {
     const session = this.findSession(id);
-    if (!session) throw new RepositoryError("not_found", "session not found: " + id);
+    if (session === null) throw new RepositoryError("not_found", "session not found");
     return session;
-  }
-
-  findSession(id: string): Session | null {
-    const row = this.one("SELECT * FROM sessions_v3 WHERE id=?", id);
-    return row ? this.session(row) : null;
   }
 
   insertSession(session: Session): void {
     this.db.prepare(
-      "INSERT INTO sessions_v3 VALUES(?,?,?,?,?)",
+      "INSERT INTO sessions_v6(id,workspace_path,root_node_id,head_revision,cursor_link_path_json,parent_session_id,parent_session_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
     ).run(
       session.id,
-      session.workspaceId,
-      session.headSnapshotId,
+      session.workspacePath,
+      session.rootNodeId,
+      session.headRevision,
+      JSON.stringify(session.cursorLinkPath),
       session.parentSessionId,
+      session.parentSessionRevision,
       session.createdAt,
+      session.updatedAt,
     );
   }
 
-  updateSessionHead(sessionId: string, snapshotId: Id): void {
-    this.db.prepare("UPDATE sessions_v3 SET head_snapshot_id=? WHERE id=?")
-      .run(snapshotId, sessionId);
-  }
-
-  getCursor(sessionId: string): Cursor {
-    const row = this.one("SELECT * FROM cursors_v3 WHERE session_id=?", sessionId);
-    if (!row) throw new RepositoryError("not_found", "cursor not found");
-    return {
-      sessionId: String(row.session_id),
-      snapshotId: this.id(row.snapshot_id),
-      entryPath: this.json(z.array(IdSchema), row.entry_path_json),
-      updatedAt: String(row.updated_at),
-    };
-  }
-
-  saveCursor(cursor: Cursor): void {
+  updateSessionHead(sessionId: string, revision: number, cursorLinkPath: Id[]): void {
     this.db.prepare(
-      "INSERT INTO cursors_v3 VALUES(?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET " +
-        "snapshot_id=excluded.snapshot_id,entry_path_json=excluded.entry_path_json,updated_at=excluded.updated_at",
-    ).run(cursor.sessionId, cursor.snapshotId, JSON.stringify(cursor.entryPath), cursor.updatedAt);
+      "UPDATE sessions_v6 SET head_revision=?,cursor_link_path_json=?,updated_at=? WHERE id=?",
+    ).run(revision, JSON.stringify(cursorLinkPath), this.timestamp(), sessionId);
   }
 
-  createNode(): Id {
-    return this.insert("INSERT INTO nodes_v3(created_at) VALUES(?)", this.timestamp());
+  updateSessionCursor(sessionId: string, cursorLinkPath: Id[]): void {
+    this.db.prepare(
+      "UPDATE sessions_v6 SET cursor_link_path_json=?,updated_at=? WHERE id=?",
+    ).run(JSON.stringify(cursorLinkPath), this.timestamp(), sessionId);
   }
 
-  createEntry(nodeId: Id): Id {
-    return this.insert("INSERT INTO entries_v3(node_id,created_at) VALUES(?,?)", nodeId, this.timestamp());
+  listSessions(workspacePath: string | null): Session[] {
+    const rows = workspacePath === null
+      ? this.all("SELECT * FROM sessions_v6")
+      : this.all("SELECT * FROM sessions_v6 WHERE workspace_path=?", workspacePath);
+    return rows.map((row) => this.session(row));
   }
 
-  getPayloadRevision(id: Id): PayloadRevision {
-    const row = this.one("SELECT * FROM payload_revisions_v3 WHERE id=?", id);
-    if (!row) throw new RepositoryError("not_found", "payload revision not found");
-    const fields = WorkFieldsSchema.parse({
-      kind: row.kind,
-      title: row.title,
-      objective: row.objective,
-      rationale: row.rationale,
-      currentState: row.current_state,
-      openQuestions: this.json(z.array(z.string()), row.open_questions_json),
-      returnCondition: row.return_condition,
-      refs: this.json(z.array(ReferenceSchema), row.refs_json),
-      metadata: this.json(z.record(z.string(), JsonSchema), row.metadata_json),
-      status: StatusSchema.parse(row.status),
-    });
-
-    return {
-      id: this.id(row.id),
-      nodeId: this.id(row.node_id),
-      predecessorId: row.predecessor_id === null ? null : this.id(row.predecessor_id),
-      version: Number(row.version),
-      createdAt: String(row.created_at),
-      ...fields,
-    };
-  }
-
-  insertPayloadRevision(nodeId: Id, predecessor: PayloadRevision | null, fields: WorkFields): PayloadRevision {
-    const id = this.insert(
-      "INSERT INTO payload_revisions_v3(node_id,predecessor_id,version,kind,title,objective,rationale,current_state," +
-        "open_questions_json,return_condition,refs_json,metadata_json,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-      nodeId,
-      predecessor === null ? null : predecessor.id,
-      predecessor ? predecessor.version + 1 : 0,
-      fields.kind,
-      fields.title,
-      fields.objective,
-      fields.rationale,
-      fields.currentState,
-      JSON.stringify(fields.openQuestions),
-      fields.returnCondition,
-      JSON.stringify(fields.refs),
-      JSON.stringify(fields.metadata),
-      fields.status,
+  createNode(sessionId: string, revision: number): Id {
+    return this.insert(
+      "INSERT INTO nodes_v6(created_session_id,created_revision,created_at) VALUES(?,?,?)",
+      sessionId,
+      revision,
       this.timestamp(),
     );
-    return this.getPayloadRevision(id);
   }
 
-  getDirectoryRevision(id: Id): DirectoryRevision {
-    const row = this.one("SELECT * FROM directory_revisions_v3 WHERE id=?", id);
-    if (!row) throw new RepositoryError("not_found", "directory revision not found");
-    return {
-      id: this.id(row.id),
-      nodeId: this.id(row.node_id),
-      predecessorId: row.predecessor_id === null ? null : this.id(row.predecessor_id),
-      version: Number(row.version),
-      createdAt: String(row.created_at),
-    };
-  }
-
-  insertDirectoryRevision(nodeId: Id, predecessor: DirectoryRevision | null, memberships: Membership[]): DirectoryRevision {
+  createLink(childNodeId: Id, sessionId: string, revision: number): Link {
     const id = this.insert(
-      "INSERT INTO directory_revisions_v3(node_id,predecessor_id,version,created_at) VALUES(?,?,?,?)",
-      nodeId,
-      predecessor === null ? null : predecessor.id,
-      predecessor ? predecessor.version + 1 : 0,
+      "INSERT INTO links_v6(child_node_id,created_session_id,created_revision,created_at) VALUES(?,?,?,?)",
+      childNodeId,
+      sessionId,
+      revision,
       this.timestamp(),
     );
-
-    const statement = this.db.prepare(
-      "INSERT INTO directory_memberships_v3(directory_revision_id,position,entry_revision_id,child_node_revision_id) VALUES(?,?,?,?)",
-    );
-    memberships.forEach((membership, position) => {
-      statement.run(id, position, membership.entryRevisionId, membership.childNodeRevisionId);
-    });
-    return this.getDirectoryRevision(id);
+    return this.getLink(id);
   }
 
-  listMemberships(directoryRevisionId: Id): Membership[] {
-    return this.all(
-      "SELECT * FROM directory_memberships_v3 WHERE directory_revision_id=? ORDER BY position",
-      directoryRevisionId,
-    ).map((row) => ({
-      position: Number(row.position),
-      entryRevisionId: this.id(row.entry_revision_id),
-      childNodeRevisionId: this.id(row.child_node_revision_id),
-    }));
-  }
-
-  getEntryRevision(id: Id): EntryRevision {
-    const row = this.one("SELECT * FROM entry_revisions_v3 WHERE id=?", id);
-    if (!row) throw new RepositoryError("not_found", "entry revision not found");
+  getLink(id: Id): Link {
+    const row = this.one("SELECT * FROM links_v6 WHERE id=?", id);
+    if (row === null) throw new RepositoryError("not_found", "link not found");
     return {
       id: this.id(row.id),
-      entryId: this.id(row.entry_id),
-      predecessorId: row.predecessor_id === null ? null : this.id(row.predecessor_id),
-      version: Number(row.version),
-      name: String(row.name),
+      childNodeId: this.id(row.child_node_id),
+      createdSessionId: String(row.created_session_id),
+      createdRevision: Number(row.created_revision),
       createdAt: String(row.created_at),
     };
   }
 
-  insertEntryRevision(entryId: Id, predecessor: EntryRevision | null, name: string): EntryRevision {
+  insertNodeRecord(nodeId: Id, sessionId: string, revision: number, attributes: WorkFields): NodeRecord {
     const id = this.insert(
-      "INSERT INTO entry_revisions_v3(entry_id,predecessor_id,version,name,created_at) VALUES(?,?,?,?,?)",
-      entryId,
-      predecessor === null ? null : predecessor.id,
-      predecessor ? predecessor.version + 1 : 0,
+      "INSERT INTO node_records_v6(node_id,session_id,revision,work_json,created_at) VALUES(?,?,?,?,?)",
+      nodeId,
+      sessionId,
+      revision,
+      JSON.stringify(WorkFieldsSchema.parse(attributes)),
+      this.timestamp(),
+    );
+    return this.getNodeRecord(id);
+  }
+
+  resolveNodeRecord(nodeId: Id, view: View): NodeRecord {
+    const row = this.resolveHistoryRow("node_records_v6", "node_id", nodeId, view);
+    if (row === null) throw new RepositoryError("not_found", "node did not exist in selected revision");
+    return this.nodeRecord(row);
+  }
+
+  nextNodeRecord(nodeId: Id, sessionId: string, revision: number): NodeRecord | null {
+    const row = this.one(
+      "SELECT * FROM node_records_v6 WHERE node_id=? AND session_id=? AND revision>? ORDER BY revision LIMIT 1",
+      nodeId,
+      sessionId,
+      revision,
+    );
+    return row === null ? null : this.nodeRecord(row);
+  }
+
+  insertLinkRecord(linkId: Id, sessionId: string, revision: number, parentNodeId: Id, name: string): LinkRecord {
+    const id = this.insert(
+      "INSERT INTO link_records_v6(link_id,session_id,revision,parent_node_id,name,created_at) VALUES(?,?,?,?,?,?)",
+      linkId,
+      sessionId,
+      revision,
+      parentNodeId,
       name,
       this.timestamp(),
     );
-    return this.getEntryRevision(id);
+    return this.getLinkRecord(id);
   }
 
-  getNodeRevision(id: Id): NodeRevision {
-    const row = this.one("SELECT * FROM node_revisions_v3 WHERE id=?", id);
-    if (!row) throw new RepositoryError("not_found", "node revision not found");
-    return {
-      id: this.id(row.id),
-      nodeId: this.id(row.node_id),
-      predecessorId: row.predecessor_id === null ? null : this.id(row.predecessor_id),
-      payloadRevisionId: this.id(row.payload_revision_id),
-      directoryRevisionId: this.id(row.directory_revision_id),
-      createdAt: String(row.created_at),
-    };
+  resolveLinkRecord(linkId: Id, view: View): LinkRecord {
+    const row = this.resolveHistoryRow("link_records_v6", "link_id", linkId, view);
+    if (row === null) throw new RepositoryError("not_found", "link did not exist in selected revision");
+    return this.linkRecord(row);
   }
 
-  insertNodeRevision(
-    nodeId: Id,
-    predecessor: NodeRevision | null,
-    payloadRevisionId: Id,
-    directoryRevisionId: Id,
-  ): NodeRevision {
-    const id = this.insert(
-      "INSERT INTO node_revisions_v3(node_id,predecessor_id,payload_revision_id,directory_revision_id,created_at) VALUES(?,?,?,?,?)",
-      nodeId,
-      predecessor === null ? null : predecessor.id,
-      payloadRevisionId,
-      directoryRevisionId,
+  nextLinkRecord(linkId: Id, sessionId: string, revision: number): LinkRecord | null {
+    const row = this.one(
+      "SELECT * FROM link_records_v6 WHERE link_id=? AND session_id=? AND revision>? ORDER BY revision LIMIT 1",
+      linkId,
+      sessionId,
+      revision,
+    );
+    return row === null ? null : this.linkRecord(row);
+  }
+
+  listEffectiveLinks(parentNodeId: Id, view: View): EffectiveLink[] {
+    const rows = this.all(
+      "WITH RECURSIVE lineage(session_id,max_revision,depth) AS (" +
+      "SELECT ?,?,0 UNION ALL " +
+      "SELECT s.parent_session_id,s.parent_session_revision,lineage.depth+1 " +
+      "FROM sessions_v6 s JOIN lineage ON s.id=lineage.session_id " +
+      "WHERE s.parent_session_id IS NOT NULL" +
+      "), ranked AS (" +
+      "SELECT r.*,l.depth,ROW_NUMBER() OVER(PARTITION BY r.link_id ORDER BY l.depth,r.revision DESC) AS rank " +
+      "FROM lineage l JOIN link_records_v6 r ON r.session_id=l.session_id AND r.revision<=l.max_revision" +
+      ") SELECT ranked.*,links_v6.child_node_id FROM ranked JOIN links_v6 ON links_v6.id=ranked.link_id " +
+      "WHERE ranked.rank=1 AND ranked.parent_node_id=? ORDER BY ranked.name,ranked.link_id",
+      view.sessionId,
+      view.revision,
+      parentNodeId,
+    );
+    return rows.map((row) => ({ ...this.linkRecord(row), childNodeId: this.id(row.child_node_id) }));
+  }
+
+  getSessionRevision(sessionId: string, revision: number): SessionRevision {
+    const row = this.one(
+      "SELECT session_id,revision,root_node_id,created_at FROM session_events_v6 WHERE session_id=? AND revision=?",
+      sessionId,
+      revision,
+    );
+    if (row === null) throw new RepositoryError("not_found", "session revision not found: r" + revision);
+    return this.sessionRevision(row);
+  }
+
+  listSessionRevisions(sessionId: string): SessionRevision[] {
+    return this.all(
+      "SELECT session_id,revision,root_node_id,created_at FROM session_events_v6 WHERE session_id=? AND revision IS NOT NULL ORDER BY revision",
+      sessionId,
+    ).map((row) => this.sessionRevision(row));
+  }
+
+  appendEvent(event: SessionEvent): void {
+    this.db.prepare(
+      "INSERT INTO session_events_v6(session_id,revision,root_node_id,operation,cursor_link_path_json,idempotency_key,payload_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
+    ).run(
+      event.sessionId,
+      event.revision,
+      event.rootNodeId,
+      event.operation,
+      JSON.stringify(event.cursorLinkPath),
+      event.idempotencyKey,
+      JSON.stringify(JsonSchema.parse(event.payload)),
       this.timestamp(),
     );
-    return this.getNodeRevision(id);
-  }
-
-  getSnapshot(id: Id): Snapshot {
-    const row = this.one("SELECT * FROM snapshots_v3 WHERE id=?", id);
-    if (!row) throw new RepositoryError("not_found", "snapshot not found");
-    return {
-      id: this.id(row.id),
-      rootNodeRevisionId: this.id(row.root_node_revision_id),
-      parentSnapshotId: row.parent_snapshot_id === null ? null : this.id(row.parent_snapshot_id),
-      createdAt: String(row.created_at),
-    };
-  }
-
-  insertSnapshot(rootNodeRevisionId: Id, parentSnapshotId: Id | null): Snapshot {
-    const id = this.insert(
-      "INSERT INTO snapshots_v3(root_node_revision_id,parent_snapshot_id,created_at) VALUES(?,?,?)",
-      rootNodeRevisionId,
-      parentSnapshotId,
-      this.timestamp(),
-    );
-    return this.getSnapshot(id);
   }
 
   insertProposal(proposal: NewProposal): Proposal {
     const id = this.insert(
-      "INSERT INTO proposals_v3(session_id,source_session_id,source_snapshot_id,target_node_id,target_node_revision_id," +
-        "patch_json,kind,status,created_at,decided_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+      "INSERT INTO proposals_v6(session_id,source_session_id,source_revision,target_node_id,base_record_id,patch_json,kind,status,created_at,decided_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
       proposal.sessionId,
       proposal.sourceSessionId,
-      proposal.sourceSnapshotId,
+      proposal.sourceRevision,
       proposal.targetNodeId,
-      proposal.targetNodeRevisionId,
-      proposal.patch ? JSON.stringify(proposal.patch) : null,
+      proposal.baseRecordId,
+      proposal.patch === null ? null : JSON.stringify(WorkPatchSchema.parse(proposal.patch)),
       proposal.kind,
       proposal.status,
       proposal.createdAt,
@@ -451,103 +345,82 @@ export class SqliteRecordRepository implements RecordRepository {
   }
 
   listPendingProposals(sessionId: string): Proposal[] {
-    return this.all(
-      "SELECT * FROM proposals_v3 WHERE session_id=? AND status='pending' ORDER BY created_at",
-      sessionId,
-    ).map((row) => this.proposal(row));
+    return this.all("SELECT * FROM proposals_v6 WHERE session_id=? AND status='pending' ORDER BY created_at", sessionId)
+      .map((row) => this.proposal(row));
   }
 
   getPendingProposal(id: Id, sessionId: string): Proposal {
-    const row = this.one(
-      "SELECT * FROM proposals_v3 WHERE id=? AND session_id=? AND status='pending'",
-      id,
-      sessionId,
-    );
-    if (!row) throw new RepositoryError("not_found", "pending proposal not found");
+    const row = this.one("SELECT * FROM proposals_v6 WHERE id=? AND session_id=? AND status='pending'", id, sessionId);
+    if (row === null) throw new RepositoryError("not_found", "pending proposal not found");
     return this.proposal(row);
   }
 
   updateProposalStatus(id: Id, status: ProposalStatus): void {
-    this.db.prepare("UPDATE proposals_v3 SET status=?,decided_at=? WHERE id=?")
-      .run(status, this.timestamp(), id);
+    this.db.prepare("UPDATE proposals_v6 SET status=?,decided_at=? WHERE id=?").run(status, this.timestamp(), id);
   }
 
   findReceipt(sessionId: string, key: string): JsonValue | null {
-    const row = this.one(
-      "SELECT result_json FROM receipts_v3 WHERE session_id=? AND idempotency_key=?",
-      sessionId,
-      key,
-    );
-    return row ? JsonSchema.parse(JSON.parse(String(row.result_json))) : null;
+    const row = this.one("SELECT result_json FROM receipts_v6 WHERE session_id=? AND idempotency_key=?", sessionId, key);
+    return row === null ? null : JsonSchema.parse(JSON.parse(String(row.result_json)));
   }
 
   saveReceipt(sessionId: string, key: string, result: unknown): void {
-    this.db.prepare("INSERT INTO receipts_v3 VALUES(?,?,?,?)")
+    this.db.prepare("INSERT INTO receipts_v6(session_id,idempotency_key,result_json,created_at) VALUES(?,?,?,?)")
       .run(sessionId, key, JSON.stringify(JsonSchema.parse(result)), this.timestamp());
   }
 
-  appendJournal(entry: JournalEntry): void {
-    this.db.prepare(
-      "INSERT INTO journal_v3(session_id,operation,previous_snapshot_id,next_snapshot_id,cursor_entry_path_json,idempotency_key,payload_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
-    ).run(
-      entry.sessionId,
-      entry.operation,
-      entry.previousSnapshotId,
-      entry.nextSnapshotId,
-      JSON.stringify(entry.cursorEntryPath),
-      entry.idempotencyKey,
-      JSON.stringify(entry.payload),
-      this.timestamp(),
+  private resolveHistoryRow(table: "node_records_v6" | "link_records_v6", idColumn: "node_id" | "link_id", id: Id, view: View): Row | null {
+    return this.one(
+      "WITH RECURSIVE lineage(session_id,max_revision,depth) AS (" +
+      "SELECT ?,?,0 UNION ALL " +
+      "SELECT s.parent_session_id,s.parent_session_revision,lineage.depth+1 " +
+      "FROM sessions_v6 s JOIN lineage ON s.id=lineage.session_id " +
+      "WHERE s.parent_session_id IS NOT NULL" +
+      ") SELECT r.* FROM lineage l JOIN " + table + " r ON r.session_id=l.session_id " +
+      "AND r.revision<=l.max_revision WHERE r." + idColumn + "=? ORDER BY l.depth,r.revision DESC LIMIT 1",
+      view.sessionId,
+      view.revision,
+      id,
     );
   }
 
-  listSessionHeadSnapshotIds(workspaceId: Id | null): Id[] {
-    const query = workspaceId === null
-      ? "SELECT head_snapshot_id FROM sessions_v3"
-      : "SELECT head_snapshot_id FROM sessions_v3 WHERE workspace_id=?";
-    const rows = workspaceId === null ? this.all(query) : this.all(query, workspaceId);
-    return rows.map((row) => this.id(row.head_snapshot_id));
-  }
-
-  listHistoricalSnapshotRootRevisionIds(workspaceId: Id | null): Id[] {
-    const seed = workspaceId === null
-      ? "SELECT head_snapshot_id AS id FROM sessions_v3"
-      : "SELECT head_snapshot_id AS id FROM sessions_v3 WHERE workspace_id=?";
-    const query = "WITH RECURSIVE lineage(id) AS (" + seed + " UNION " +
-      "SELECT snapshots_v3.parent_snapshot_id FROM snapshots_v3 JOIN lineage " +
-      "ON snapshots_v3.id=lineage.id WHERE snapshots_v3.parent_snapshot_id IS NOT NULL) " +
-      "SELECT DISTINCT snapshots_v3.root_node_revision_id FROM snapshots_v3 JOIN lineage " +
-      "ON snapshots_v3.id=lineage.id";
-    const rows = workspaceId === null ? this.all(query) : this.all(query, workspaceId);
-    return rows.map((row) => this.id(row.root_node_revision_id));
+  private getNodeRecord(id: Id): NodeRecord {
+    const row = this.one("SELECT * FROM node_records_v6 WHERE id=?", id);
+    if (row === null) throw new RepositoryError("not_found", "node record not found");
+    return this.nodeRecord(row);
   }
 
   private getProposal(id: Id): Proposal {
-    const row = this.one("SELECT * FROM proposals_v3 WHERE id=?", id);
-    if (!row) throw new RepositoryError("not_found", "proposal not found");
+    const row = this.one("SELECT * FROM proposals_v6 WHERE id=?", id);
+    if (row === null) throw new RepositoryError("not_found", "proposal not found");
     return this.proposal(row);
   }
 
-  private proposal(row: Row): Proposal {
+  private getLinkRecord(id: Id): LinkRecord {
+    const row = this.one("SELECT * FROM link_records_v6 WHERE id=?", id);
+    if (row === null) throw new RepositoryError("not_found", "link record not found");
+    return this.linkRecord(row);
+  }
+
+  private nodeRecord(row: Row): NodeRecord {
     return {
       id: this.id(row.id),
+      nodeId: this.id(row.node_id),
       sessionId: String(row.session_id),
-      sourceSessionId: row.source_session_id === null ? null : String(row.source_session_id),
-      sourceSnapshotId: this.id(row.source_snapshot_id),
-      targetNodeId: this.id(row.target_node_id),
-      targetNodeRevisionId: this.id(row.target_node_revision_id),
-      patch: row.patch_json === null ? null : WorkPatchSchema.parse(JSON.parse(String(row.patch_json))),
-      kind: ProposalKindSchema.parse(row.kind),
-      status: ProposalStatusSchema.parse(row.status),
+      revision: Number(row.revision),
+      attributes: this.json(WorkFieldsSchema, row.work_json),
       createdAt: String(row.created_at),
-      decidedAt: row.decided_at === null ? null : String(row.decided_at),
     };
   }
 
-  private workspace(row: Row): Workspace {
+  private linkRecord(row: Row): LinkRecord {
     return {
       id: this.id(row.id),
-      canonicalPath: String(row.canonical_path),
+      linkId: this.id(row.link_id),
+      sessionId: String(row.session_id),
+      revision: Number(row.revision),
+      parentNodeId: this.id(row.parent_node_id),
+      name: String(row.name),
       createdAt: String(row.created_at),
     };
   }
@@ -555,10 +428,39 @@ export class SqliteRecordRepository implements RecordRepository {
   private session(row: Row): Session {
     return {
       id: String(row.id),
-      workspaceId: this.id(row.workspace_id),
-      headSnapshotId: this.id(row.head_snapshot_id),
+      workspacePath: String(row.workspace_path),
+      rootNodeId: this.id(row.root_node_id),
+      headRevision: Number(row.head_revision),
+      cursorLinkPath: this.json(z.array(IdSchema), row.cursor_link_path_json),
       parentSessionId: row.parent_session_id === null ? null : String(row.parent_session_id),
+      parentSessionRevision: row.parent_session_revision === null ? null : Number(row.parent_session_revision),
       createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  private sessionRevision(row: Row): SessionRevision {
+    return {
+      sessionId: String(row.session_id),
+      revision: Number(row.revision),
+      rootNodeId: this.id(row.root_node_id),
+      createdAt: String(row.created_at),
+    };
+  }
+
+  private proposal(row: Row): Proposal {
+    return {
+      id: this.id(row.id),
+      sessionId: String(row.session_id),
+      sourceSessionId: row.source_session_id === null ? null : String(row.source_session_id),
+      sourceRevision: Number(row.source_revision),
+      targetNodeId: this.id(row.target_node_id),
+      baseRecordId: this.id(row.base_record_id),
+      patch: row.patch_json === null ? null : WorkPatchSchema.parse(JSON.parse(String(row.patch_json))),
+      kind: ProposalKindSchema.parse(row.kind),
+      status: ProposalStatusSchema.parse(row.status),
+      createdAt: String(row.created_at),
+      decidedAt: row.decided_at === null ? null : String(row.decided_at),
     };
   }
 
@@ -573,7 +475,7 @@ export class SqliteRecordRepository implements RecordRepository {
 
   private insert(sql: string, ...values: SqlValue[]): Id {
     const row = this.db.prepare(sql + " RETURNING id").get(...values);
-    if (!row) throw new RepositoryError("invariant", "insert did not return id");
+    if (row === undefined) throw new RepositoryError("invariant", "insert did not return id");
     return this.id(RowSchema.parse(row).id);
   }
 

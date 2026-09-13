@@ -1,10 +1,10 @@
 # Context Tree
 
-Context Tree is a local persistent continuation notebook for Codex. Its v3
-public API is a cursor-relative virtual filesystem: named nodes carry work
-payloads and can contain child nodes. Immutable snapshots, node revisions,
-entry revisions, and copy-on-write directory revisions remain implementation
-details behind the daemon.
+Context Tree is a local persistent continuation notebook for Codex. Its v6
+storage model separates logical node work from directory topology: nodes are
+inode-like continuation identities, while stable links own historical names and
+placements. Public history is a per-session timeline (`r0`, `r1`, ...), where
+each revision is a frozen `{session, revision}` view.
 
 The plugin runtime is bundled in the checked-in dist directory. A fresh
 marketplace checkout can therefore run its MCP server and hooks on Node 22 or
@@ -61,9 +61,21 @@ and arrays are raw, balanced JSON arguments. The shell preserves other
 backslash sequences for Context Tree path parsing.
 
 Paths use `/`; `\\` escapes literal `/`, `\\`, `.` and `..` names. Names are
-Unicode NFC and case-sensitive. `mv` retains node and entry identity for a
-same-name move; a rename writes an entry revision. `rev-list` reports the
-chronological node-revision line, labelling payload and directory changes.
+Unicode NFC and case-sensitive. `mv` retains stable node and directory-link
+identity for a same-name move or a rename. Record and snapshot IDs are internal
+implementation details.
+
+Every state mutation creates one lightweight session revision, while `cd`
+changes only the cursor. Node work updates append node history; `mkdir`, moves,
+and renames append link history. A selected revision resolves both histories
+as-of that fixed view, so a child work update is visible through every active
+link without rewriting parent directories. `rev-list [path] [--reference=N]`
+reports semantic work, child, rename, and move history.
+`rev-show <revision> [path] [--reference=N]` resolves the path identity at the
+reference revision (the head by default) and renders it at the selected
+revision. `ls` also accepts `--revision=N --reference=N` for historical
+directory inspection. Session revisions are public; SQLite node, link, and
+history-record IDs are not.
 
 Set `CONTEXT_TREE_DEBUG=1` for daemon-owned JSONL diagnostics in the data
 directory. It logs operation metadata but not work content. Set
@@ -84,8 +96,9 @@ It listens only on `127.0.0.1` and prints its address. The landing page asks
 for an existing Context Tree session ID, stores it in a local `HttpOnly`,
 `SameSite=Strict` cookie, and redirects to `/browse/`. Browse a node directly
 with `http://127.0.0.1:<port>/browse/<path>`; add `?revision=<id>` to inspect a
-historical revision of that node. The page is read-only and queries the daemon
-instead of opening SQLite.
+historical session revision. Add `?reference=<id>` when the URL path should be
+resolved against a historical state rather than the session head. The page is
+read-only and queries the daemon instead of opening SQLite.
 
 ## Runtime updates
 

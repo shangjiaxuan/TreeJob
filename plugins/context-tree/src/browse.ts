@@ -77,7 +77,8 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
   try {
     const path = decodePath(target.pathname.slice("/browse".length));
     const revisionId = parseRevision(target.searchParams.get("revision"));
-    const result = await readBrowserView(sessionId, path, revisionId);
+    const referenceId = parseRevision(target.searchParams.get("reference"));
+    const result = await readBrowserView(sessionId, path, revisionId, referenceId);
     html(response, 200, renderBrowsePage(result));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

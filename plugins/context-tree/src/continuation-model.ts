@@ -1,359 +1,232 @@
-import { platform } from "node:os";
-import { resolve } from "node:path";
+import { resolve as resolveFilesystemPath } from "node:path";
 import {
   RepositoryError,
-  type Cursor,
-  type DirectoryRevision,
-  type EntryRevision,
-  type Membership,
-  type NodeRevision,
-  type PayloadRevision,
+  type EffectiveLink,
+  type Link,
+  type NodeRecord,
   type Proposal,
   type RecordRepository,
   type Session,
-  type Snapshot,
-  type Workspace,
+  type SessionRevision,
+  type View,
 } from "./record-repository.js";
 import {
   WorkFieldsSchema,
-  IdSchema,
   type Id,
   type ProposalDecision,
-  type ProposalKind,
-  type RecordStatus,
   type WorkFields,
   type WorkPatch,
 } from "./schema.js";
 
-const terminal = new Set<RecordStatus>(["done", "abandoned", "superseded"]);
+const terminal = new Set(["done", "abandoned", "superseded"]);
 
 export type ResolvedNode = {
-  nodeRevision: NodeRevision;
-  payload: PayloadRevision;
-  directory: DirectoryRevision;
-  memberships: Membership[];
-  entryPath: Id[];
+  nodeId: Id;
+  record: NodeRecord;
+  linkPath: Id[];
   names: string[];
+  linkId: Id | null;
 };
 
 export type ResolvedSession = {
   session: Session;
-  snapshot: Snapshot;
-  cursor: Cursor;
+  view: SessionRevision;
   nodes: ResolvedNode[];
 };
 
+export type StateMutation = {
+  changed: boolean;
+  cursorLinkPath: Id[];
+};
+
 export type ProposalMutation =
-  | {
-    kind: "unchanged";
-    cursorEntryPath: Id[];
-    status: "rejected" | "discarded";
-  }
-  | {
-    kind: "snapshot";
-    rootNodeRevisionId: Id;
-    cursorEntryPath: Id[];
-    status: "applied";
-  };
+  | { kind: "unchanged"; cursorLinkPath: Id[]; status: "rejected" | "discarded" }
+  | { kind: "state"; cursorLinkPath: Id[]; status: "applied" };
 
-type DirectoryEdit = {
-  remove: Set<Id>;
-  add: Membership[];
-};
+type PathSegment = { value: string; escaped: boolean };
+type LinkLocation = { parentNodeId: Id; name: string };
 
-type PathSegment = {
-  value: string;
-  escaped: boolean;
-};
-
+/**
+ * v6 evaluates work and topology independently in an explicit session view.
+ * Node records hold work; link records hold names and placement.
+ */
 export class ContinuationModel {
   constructor(private readonly records: RecordRepository) {}
 
   createSession(sessionId: string, cwd: string): ResolvedSession {
-    const canonicalPath = this.canonicalWorkspacePath(cwd);
-    const workspace = this.records.findWorkspace(canonicalPath) ??
-      this.records.insertWorkspace(canonicalPath);
-    const root = this.createNode({
-      kind: "node",
-      title: "",
-      objective: "",
-      rationale: "",
-      currentState: "New continuation session.",
-      openQuestions: [],
-      returnCondition: "",
-      refs: [],
-      metadata: {},
-      status: "open",
-    });
-    const snapshot = this.records.insertSnapshot(root.id, null);
-    const session: Session = {
+    const createdAt = this.timestamp();
+    const rootNodeId = this.records.createNode(sessionId, 0);
+    this.records.insertNodeRecord(rootNodeId, sessionId, 0, this.emptyWork());
+    this.records.insertSession({
       id: sessionId,
-      workspaceId: workspace.id,
-      headSnapshotId: snapshot.id,
+      workspacePath: resolveFilesystemPath(cwd),
+      rootNodeId,
+      headRevision: 0,
+      cursorLinkPath: [],
       parentSessionId: null,
-      createdAt: this.timestamp(),
-    };
-    const cursor: Cursor = {
+      parentSessionRevision: null,
+      createdAt,
+      updatedAt: createdAt,
+    });
+    this.records.appendEvent({
       sessionId,
-      snapshotId: snapshot.id,
-      entryPath: [],
-      updatedAt: this.timestamp(),
-    };
-
-    this.records.insertSession(session);
-    this.records.saveCursor(cursor);
+      revision: 0,
+      rootNodeId,
+      operation: "pwd",
+      cursorLinkPath: [],
+      idempotencyKey: null,
+      payload: {},
+    });
     return this.resolveSession(sessionId);
   }
 
   validateWorkspace(session: Session, cwd: string): void {
-    const workspace = this.records.getWorkspace(session.workspaceId);
-    const supplied = this.canonicalWorkspacePath(cwd);
-
-    if (workspace.canonicalPath !== supplied) {
-      throw new RepositoryError("conflict", "session is already bound to a different workspace");
+    if (session.workspacePath !== resolveFilesystemPath(cwd)) {
+      throw new RepositoryError("conflict", "session is bound to a different workspace");
     }
   }
 
   resolveSession(sessionId: string): ResolvedSession {
     const session = this.records.getSession(sessionId);
-    const snapshot = this.records.getSnapshot(session.headSnapshotId);
-    const cursor = this.records.getCursor(sessionId);
-
-    if (cursor.snapshotId !== snapshot.id) {
-      throw new RepositoryError("invariant", "cursor does not match session head");
+    const view = this.records.getSessionRevision(sessionId, session.headRevision);
+    const root = this.root(view);
+    const nodes = [root];
+    let current = root;
+    for (const linkId of session.cursorLinkPath) {
+      current = this.resolveChild(view, current, linkId);
+      nodes.push(current);
     }
+    return { session, view, nodes };
+  }
 
-    const nodes: ResolvedNode[] = [];
-    let nodeRevision = this.records.getNodeRevision(snapshot.rootNodeRevisionId);
-    let names: string[] = [];
-    nodes.push(this.resolved(nodeRevision, [], names));
-
-    for (const entryId of cursor.entryPath) {
-      const parent = nodes[nodes.length - 1];
-      if (!parent) throw new RepositoryError("invariant", "missing cursor parent");
-      const membership = parent.memberships.find((member) =>
-        this.records.getEntryRevision(member.entryRevisionId).entryId === entryId
-      );
-      if (!membership) {
-        throw new RepositoryError("conflict", "cursor entry is not reachable from session head");
-      }
-      const entry = this.records.getEntryRevision(membership.entryRevisionId);
-      nodeRevision = this.records.getNodeRevision(membership.childNodeRevisionId);
-      names = [...names, entry.name];
-      nodes.push(this.resolved(nodeRevision, [...parent.entryPath, entryId], names));
-    }
-
-    return { session, snapshot, cursor, nodes };
+  resolveSessionRevision(sessionId: string, revision: number): { session: Session; view: SessionRevision } {
+    return { session: this.records.getSession(sessionId), view: this.records.getSessionRevision(sessionId, revision) };
   }
 
   resolvePath(resolved: ResolvedSession, rawPath: string): ResolvedNode {
-    if (rawPath === ".") {
-      return this.current(resolved);
-    }
-
-    const absolute = rawPath.startsWith("/");
-    const segments = this.parsePath(rawPath);
-    let nodes = absolute
-      ? [this.valueAt(resolved.nodes, 0, "session has no root node")]
-      : [...resolved.nodes];
-
-    for (const segment of segments) {
-      if (!segment.escaped && segment.value === ".") continue;
-      if (!segment.escaped && segment.value === "..") {
-        if (nodes.length > 1) nodes.pop();
-        continue;
-      }
-      const parent = nodes[nodes.length - 1];
-      if (!parent) throw new RepositoryError("invariant", "path has no root");
-      const membership = parent.memberships.find((member) =>
-        this.records.getEntryRevision(member.entryRevisionId).name === segment.value
-      );
-      if (!membership) throw new RepositoryError("not_found", "path not found: " + rawPath);
-      const entry = this.records.getEntryRevision(membership.entryRevisionId);
-      nodes.push(this.resolved(
-        this.records.getNodeRevision(membership.childNodeRevisionId),
-        [...parent.entryPath, entry.entryId],
-        [...parent.names, entry.name],
-      ));
-    }
-
-    return this.valueAt(nodes, nodes.length - 1, "path has no root node");
+    return this.resolvePathAt(resolved.view, this.current(resolved), rawPath);
   }
 
-  mkdir(resolved: ResolvedSession, name: string, patch: WorkPatch): {
-    rootNodeRevisionId: Id;
-    cursorEntryPath: Id[];
-  } {
-    const normalizedName = this.normalizeName(name);
+  resolveView(
+    sessionId: string,
+    selectedRevision: number,
+    referenceRevision: number | undefined,
+    rawPath: string,
+  ): { selected: SessionRevision; node: ResolvedNode } {
+    const session = this.records.getSession(sessionId);
+    const reference = this.referenceNode(session, referenceRevision, rawPath);
+    const selected = this.records.getSessionRevision(sessionId, selectedRevision);
+    const node = this.findNode(selected, reference.nodeId);
+    if (node === null) throw new RepositoryError("not_found", "node did not exist in selected revision r" + selectedRevision);
+    return { selected, node };
+  }
+
+  mkdir(resolved: ResolvedSession, revision: number, name: string, patch: WorkPatch): StateMutation {
     const parent = this.current(resolved);
-    this.ensureNameAvailable(parent.memberships, normalizedName);
-    const child = this.createNode(this.mergeWork(this.emptyWork(), patch));
-    const entryId = this.records.createEntry(child.nodeId);
-    const entry = this.records.insertEntryRevision(entryId, null, normalizedName);
-    const rootNodeRevisionId = this.rewriteDirectories(
-      resolved.snapshot.rootNodeRevisionId,
-      new Map([[this.pathKey(parent.entryPath), {
-        remove: new Set<Id>(),
-        add: [{
-          position: parent.memberships.length,
-          entryRevisionId: entry.id,
-          childNodeRevisionId: child.id,
-        }],
-      }]]),
-    );
-    return { rootNodeRevisionId, cursorEntryPath: resolved.cursor.entryPath };
+    const normalizedName = this.normalizeName(name);
+    this.ensureNameAvailable(this.entries(resolved.view, parent), normalizedName);
+    const childNodeId = this.records.createNode(resolved.session.id, revision);
+    const link = this.records.createLink(childNodeId, resolved.session.id, revision);
+    this.records.insertNodeRecord(childNodeId, resolved.session.id, revision, this.mergeWork(this.emptyWork(), patch));
+    this.records.insertLinkRecord(link.id, resolved.session.id, revision, parent.nodeId, normalizedName);
+    return { changed: true, cursorLinkPath: resolved.session.cursorLinkPath };
   }
 
-  edit(resolved: ResolvedSession, patch: WorkPatch): {
-    rootNodeRevisionId: Id;
-    cursorEntryPath: Id[];
-  } {
+  edit(resolved: ResolvedSession, revision: number, patch: WorkPatch): StateMutation {
     const current = this.current(resolved);
-    const nextPayload = this.records.insertPayloadRevision(
-      current.nodeRevision.nodeId,
-      current.payload,
-      this.mergeWork(this.work(current.payload), patch),
+    this.records.insertNodeRecord(
+      current.nodeId,
+      resolved.session.id,
+      revision,
+      this.mergeWork(current.record.attributes, patch),
     );
-    const replacement = this.records.insertNodeRevision(
-      current.nodeRevision.nodeId,
-      current.nodeRevision,
-      nextPayload.id,
-      current.directory.id,
-    );
-    return {
-      rootNodeRevisionId: this.replaceNodeAtPath(
-        resolved.snapshot.rootNodeRevisionId,
-        current.entryPath,
-        replacement.id,
-      ),
-      cursorEntryPath: resolved.cursor.entryPath,
-    };
+    return { changed: true, cursorLinkPath: resolved.session.cursorLinkPath };
   }
 
-  cd(resolved: ResolvedSession, path: string): {
-    rootNodeRevisionId: Id;
-    cursorEntryPath: Id[];
-  } {
-    const target = this.resolvePath(resolved, path);
-    return {
-      rootNodeRevisionId: resolved.snapshot.rootNodeRevisionId,
-      cursorEntryPath: target.entryPath,
-    };
+  cd(resolved: ResolvedSession, path: string): StateMutation {
+    return { changed: false, cursorLinkPath: this.resolvePath(resolved, path).linkPath };
   }
 
-  close(resolved: ResolvedSession, summary: string, status: "done" | "abandoned" | "superseded"): {
-    rootNodeRevisionId: Id;
-    cursorEntryPath: Id[];
-  } {
+  close(
+    resolved: ResolvedSession,
+    revision: number,
+    summary: string,
+    status: "done" | "abandoned" | "superseded",
+  ): StateMutation {
     const current = this.current(resolved);
-    if (this.hasOpenDescendant(current.nodeRevision.id)) {
-      throw new RepositoryError("invariant", "cannot close a node with non-terminal descendants");
+    if (this.hasOpenDescendant(resolved.view, current, new Set([current.nodeId]))) {
+      throw new RepositoryError("invariant", "cannot close a node with open descendants");
     }
-    const nextPayload = this.records.insertPayloadRevision(
-      current.nodeRevision.nodeId,
-      current.payload,
-      this.mergeWork(this.work(current.payload), { currentState: summary, status }),
-    );
-    const replacement = this.records.insertNodeRevision(
-      current.nodeRevision.nodeId,
-      current.nodeRevision,
-      nextPayload.id,
-      current.directory.id,
+    this.records.insertNodeRecord(
+      current.nodeId,
+      resolved.session.id,
+      revision,
+      this.mergeWork(current.record.attributes, { status, currentState: summary }),
     );
     return {
-      rootNodeRevisionId: this.replaceNodeAtPath(
-        resolved.snapshot.rootNodeRevisionId,
-        current.entryPath,
-        replacement.id,
-      ),
-      cursorEntryPath: current.entryPath.length > 0
-        ? current.entryPath.slice(0, -1)
-        : current.entryPath,
+      changed: true,
+      cursorLinkPath: current.linkPath.length === 0 ? current.linkPath : current.linkPath.slice(0, -1),
     };
   }
 
-  move(resolved: ResolvedSession, sourcePath: string, destinationPath: string): {
-    rootNodeRevisionId: Id;
-    cursorEntryPath: Id[];
-  } {
+  move(resolved: ResolvedSession, revision: number, sourcePath: string, destinationPath: string): StateMutation {
     const source = this.resolvePath(resolved, sourcePath);
-    if (source.entryPath.length === 0) {
+    if (source.linkId === null || source.linkPath.length === 0) {
       throw new RepositoryError("invariant", "cannot move the root node");
     }
-    const sourceParentPath = source.entryPath.slice(0, -1);
-    const sourceEntryId = this.valueAt(
-      source.entryPath,
-      source.entryPath.length - 1,
-      "source entry is missing",
-    );
-    const sourceParent = this.resolveEntryPath(resolved, sourceParentPath);
-    const sourceMembership = sourceParent.memberships.find((membership) =>
-      this.records.getEntryRevision(membership.entryRevisionId).entryId === sourceEntryId
-    );
-    if (!sourceMembership) throw new RepositoryError("invariant", "source membership not found");
-    const sourceEntry = this.records.getEntryRevision(sourceMembership.entryRevisionId);
-
-    const destination = this.resolveMoveDestination(resolved, destinationPath, sourceEntry.name);
-    if (this.startsWith(destination.parent.entryPath, source.entryPath)) {
-      throw new RepositoryError("invariant", "cannot move a node into itself or its descendant");
+    const sourceLink = this.records.resolveLinkRecord(source.linkId, resolved.view);
+    const destination = this.resolveMoveDestination(resolved, destinationPath, sourceLink.name);
+    if (this.startsWith(destination.parent.linkPath, source.linkPath)) {
+      throw new RepositoryError("invariant", "cannot move a node into its descendant");
     }
-    const sameParent = this.pathKey(sourceParentPath) === this.pathKey(destination.parent.entryPath);
-    const existing = destination.parent.memberships.filter((membership) =>
-      this.records.getEntryRevision(membership.entryRevisionId).entryId !== sourceEntryId
+    this.ensureMoveName(resolved.view, destination.parent, source.linkId, destination.name);
+    this.records.insertLinkRecord(
+      source.linkId,
+      resolved.session.id,
+      revision,
+      destination.parent.nodeId,
+      destination.name,
     );
-    this.ensureNameAvailable(existing, destination.name);
-
-    const entryRevision = destination.name === sourceEntry.name
-      ? sourceEntry
-      : this.records.insertEntryRevision(sourceEntry.entryId, sourceEntry, destination.name);
-    const edits = new Map<string, DirectoryEdit>();
-    this.addDirectoryEdit(edits, sourceParentPath, { remove: new Set([sourceEntryId]), add: [] });
-    this.addDirectoryEdit(edits, destination.parent.entryPath, {
-      remove: sameParent ? new Set<Id>() : new Set<Id>(),
-      add: [{
-        position: destination.parent.memberships.length,
-        entryRevisionId: entryRevision.id,
-        childNodeRevisionId: sourceMembership.childNodeRevisionId,
-      }],
-    });
-
-    const rootNodeRevisionId = this.rewriteDirectories(
-      resolved.snapshot.rootNodeRevisionId,
-      edits,
-    );
-    const cursorEntryPath = this.repairMovedCursor(
-      resolved.cursor.entryPath,
-      source.entryPath,
-      [...destination.parent.entryPath, sourceEntryId],
-    );
-    return { rootNodeRevisionId, cursorEntryPath };
+    return {
+      changed: true,
+      cursorLinkPath: this.repairMovedCursor(
+        resolved.session.cursorLinkPath,
+        source.linkPath,
+        [...destination.parent.linkPath, source.linkId],
+      ),
+    };
   }
 
   fork(resolved: ResolvedSession, newSessionId: string): ResolvedSession {
-    if (this.records.findSession(newSessionId)) {
-      return this.resolveSession(newSessionId);
-    }
-    const session: Session = {
+    const existing = this.records.findSession(newSessionId);
+    if (existing !== null) return this.resolveSession(newSessionId);
+    const createdAt = this.timestamp();
+    this.records.insertSession({
       id: newSessionId,
-      workspaceId: resolved.session.workspaceId,
-      headSnapshotId: resolved.snapshot.id,
+      workspacePath: resolved.session.workspacePath,
+      rootNodeId: resolved.view.rootNodeId,
+      headRevision: 0,
+      cursorLinkPath: resolved.session.cursorLinkPath,
       parentSessionId: resolved.session.id,
-      createdAt: this.timestamp(),
-    };
-    const cursor: Cursor = {
+      parentSessionRevision: resolved.view.revision,
+      createdAt,
+      updatedAt: createdAt,
+    });
+    this.records.appendEvent({
       sessionId: newSessionId,
-      snapshotId: resolved.snapshot.id,
-      entryPath: resolved.cursor.entryPath,
-      updatedAt: this.timestamp(),
-    };
-    this.records.insertSession(session);
-    this.records.saveCursor(cursor);
+      revision: 0,
+      rootNodeId: resolved.view.rootNodeId,
+      operation: "fork",
+      cursorLinkPath: resolved.session.cursorLinkPath,
+      idempotencyKey: null,
+      payload: { parentSessionId: resolved.session.id, parentRevision: resolved.view.revision },
+    });
     return this.resolveSession(newSessionId);
   }
 
   createProposal(
     resolved: ResolvedSession,
-    kind: ProposalKind,
+    kind: Proposal["kind"],
     patch: WorkPatch | null,
     sourceSessionId: string | null,
   ): Proposal {
@@ -361,9 +234,9 @@ export class ContinuationModel {
     return this.records.insertProposal({
       sessionId: resolved.session.id,
       sourceSessionId,
-      sourceSnapshotId: resolved.snapshot.id,
-      targetNodeId: current.nodeRevision.nodeId,
-      targetNodeRevisionId: current.nodeRevision.id,
+      sourceRevision: resolved.view.revision,
+      targetNodeId: current.nodeId,
+      baseRecordId: current.record.id,
       patch,
       kind,
       status: "pending",
@@ -374,353 +247,230 @@ export class ContinuationModel {
 
   decideProposal(
     resolved: ResolvedSession,
+    revision: number,
     proposal: Proposal,
     decision: ProposalDecision,
     replacement: WorkPatch | null,
   ): ProposalMutation {
     if (decision === "reject" || decision === "discard") {
-      return {
-        kind: "unchanged",
-        cursorEntryPath: resolved.cursor.entryPath,
-        status: decision === "reject" ? "rejected" : "discarded",
-      };
+      return { kind: "unchanged", cursorLinkPath: resolved.session.cursorLinkPath, status: decision === "reject" ? "rejected" : "discarded" };
     }
-    if (proposal.sourceSnapshotId !== resolved.snapshot.id) {
-      throw new RepositoryError("conflict", "proposal is stale against the current session head");
-    }
-    const current = this.current(resolved);
-    if (current.nodeRevision.id !== proposal.targetNodeRevisionId) {
-      throw new RepositoryError("conflict", "proposal target is no longer the current node");
+    const current = this.records.resolveNodeRecord(proposal.targetNodeId, resolved.view);
+    if (current.id !== proposal.baseRecordId) {
+      throw new RepositoryError("conflict", "proposal target changed since it was created");
     }
     const patch = decision === "accept" ? proposal.patch : replacement;
-    if (!patch) throw new RepositoryError("invariant", "proposal decision requires a patch");
-    const mutation = this.edit(resolved, patch);
-    return { kind: "snapshot", ...mutation, status: "applied" };
+    if (patch === null) throw new RepositoryError("invariant", "proposal decision requires a patch");
+    this.records.insertNodeRecord(
+      proposal.targetNodeId,
+      resolved.session.id,
+      revision,
+      this.mergeWork(current.attributes, patch),
+    );
+    return { kind: "state", cursorLinkPath: resolved.session.cursorLinkPath, status: "applied" };
   }
 
-  listNodeRevisions(node: ResolvedNode): NodeRevision[] {
-    const output: NodeRevision[] = [];
-    let revision: NodeRevision | null = node.nodeRevision;
-    while (revision) {
-      output.push(revision);
-      revision = revision.predecessorId
-        ? this.records.getNodeRevision(revision.predecessorId)
-        : null;
+  allNodes(resolved: ResolvedSession): ResolvedNode[] {
+    return this.walk(resolved.view, this.root(resolved.view));
+  }
+
+  allNodesBelow(resolved: ResolvedSession, node: ResolvedNode): ResolvedNode[] {
+    return this.walk(resolved.view, node);
+  }
+
+  allNodesAtView(view: View): ResolvedNode[] {
+    return this.walk(view, this.root(view));
+  }
+
+  history(
+    sessionId: string,
+    referenceRevision: number | undefined,
+    rawPath: string,
+  ): Array<{ revision: SessionRevision; node: ResolvedNode; changes: Array<"work" | "children" | "renamed" | "moved"> }> {
+    const session = this.records.getSession(sessionId);
+    const reference = this.referenceNode(session, referenceRevision, rawPath);
+    let previous: { view: SessionRevision; node: ResolvedNode; location: LinkLocation | null } | null = null;
+    const output: Array<{ revision: SessionRevision; node: ResolvedNode; changes: Array<"work" | "children" | "renamed" | "moved"> }> = [];
+    for (const view of this.records.listSessionRevisions(sessionId)) {
+      const node = this.findNode(view, reference.nodeId);
+      if (node === null) continue;
+      const location = reference.linkId === null ? null : this.linkLocation(view, reference.linkId);
+      const changes = this.semanticChanges(view, previous, { node, location });
+      if (changes.length > 0) output.push({ revision: view, node, changes });
+      previous = { view, node, location };
     }
     return output;
   }
 
-  revisionOnLineage(node: ResolvedNode, revisionId: Id): NodeRevision {
-    const found = this.listNodeRevisions(node).find((revision) =>
-      revision.id === revisionId
-    );
-    if (!found || found.nodeId !== node.nodeRevision.nodeId) {
-      throw new RepositoryError("not_found", "revision is not on the current node lineage");
-    }
-    return found;
+  work(node: ResolvedNode): WorkFields {
+    return node.record.attributes;
   }
 
-  countUnresolved(resolved: ResolvedSession): number {
-    return this.walk(resolved.snapshot.rootNodeRevisionId).filter((node) =>
-      !terminal.has(node.payload.status)
-    ).length;
-  }
-
-  allNodes(resolved: ResolvedSession): ResolvedNode[] {
-    return this.walk(resolved.snapshot.rootNodeRevisionId);
-  }
-
-  allNodesAt(rootNodeRevisionId: Id): ResolvedNode[] {
-    return this.walk(rootNodeRevisionId);
-  }
-
-  allNodesBelow(node: ResolvedNode): ResolvedNode[] {
-    return this.walk(node.nodeRevision.id, node.entryPath, node.names);
-  }
-
-  public work(payload: PayloadRevision): WorkFields {
-    return WorkFieldsSchema.parse({
-      kind: payload.kind,
-      title: payload.title,
-      objective: payload.objective,
-      rationale: payload.rationale,
-      currentState: payload.currentState,
-      openQuestions: payload.openQuestions,
-      returnCondition: payload.returnCondition,
-      refs: payload.refs,
-      metadata: payload.metadata,
-      status: payload.status,
-    });
-  }
-
-  public current(resolved: ResolvedSession): ResolvedNode {
-    const current = resolved.nodes[resolved.nodes.length - 1];
-    if (!current) throw new RepositoryError("invariant", "session has no root node");
+  current(resolved: ResolvedSession): ResolvedNode {
+    const current = resolved.nodes.at(-1);
+    if (current === undefined) throw new RepositoryError("invariant", "session has no root node");
     return current;
   }
 
-  public entrySummaries(node: ResolvedNode): Array<{
-    name: string;
-    child: ResolvedNode;
-  }> {
-    return node.memberships.map((membership) => {
-      const entry = this.records.getEntryRevision(membership.entryRevisionId);
-      return {
-        name: entry.name,
-        child: this.resolved(
-          this.records.getNodeRevision(membership.childNodeRevisionId),
-          [...node.entryPath, entry.entryId],
-          [...node.names, entry.name],
-        ),
-      };
-    });
+  entries(view: View, node: ResolvedNode): Array<{ name: string; child: ResolvedNode }> {
+    return this.records.listEffectiveLinks(node.nodeId, view).map((link) => ({
+      name: link.name,
+      child: this.resolveEffectiveLink(view, node, link),
+    }));
   }
 
-  public path(node: ResolvedNode): string {
-    return node.names.length === 0 ? "/" : "/" + node.names.map((name) =>
-      this.escapeName(name)
-    ).join("/");
+  path(node: ResolvedNode): string {
+    return node.names.length === 0 ? "/" : "/" + node.names.map((name) => this.escapeName(name)).join("/");
   }
 
-  public changes(revision: NodeRevision): Array<"payload" | "directory"> {
-    if (!revision.predecessorId) return ["payload", "directory"];
-    const previous = this.records.getNodeRevision(revision.predecessorId);
-    const changes: Array<"payload" | "directory"> = [];
-    if (previous.payloadRevisionId !== revision.payloadRevisionId) changes.push("payload");
-    if (previous.directoryRevisionId !== revision.directoryRevisionId) changes.push("directory");
+  private root(view: View): ResolvedNode {
+    return this.resolveNode(view, view.rootNodeId, [], [], null);
+  }
+
+  private resolveNode(view: View, nodeId: Id, linkPath: Id[], names: string[], linkId: Id | null): ResolvedNode {
+    return { nodeId, record: this.records.resolveNodeRecord(nodeId, view), linkPath, names, linkId };
+  }
+
+  private resolveChild(view: View, parent: ResolvedNode, linkId: Id): ResolvedNode {
+    const link = this.records.resolveLinkRecord(linkId, view);
+    if (link.parentNodeId !== parent.nodeId) throw new RepositoryError("not_found", "link path is not reachable");
+    const stable = this.records.getLink(linkId);
+    return this.resolveEffectiveLink(view, parent, { ...link, childNodeId: stable.childNodeId });
+  }
+
+  private resolveEffectiveLink(view: View, parent: ResolvedNode, link: EffectiveLink): ResolvedNode {
+    if (link.parentNodeId !== parent.nodeId) throw new RepositoryError("invariant", "link resolves to the wrong parent");
+    return this.resolveNode(
+      view,
+      link.childNodeId,
+      [...parent.linkPath, link.linkId],
+      [...parent.names, link.name],
+      link.linkId,
+    );
+  }
+
+  private resolvePathAt(view: View, start: ResolvedNode, rawPath: string): ResolvedNode {
+    if (rawPath === ".") return start;
+    let current = rawPath.startsWith("/") ? this.root(view) : start;
+    for (const segment of this.parsePath(rawPath)) {
+      if (!segment.escaped && segment.value === ".") continue;
+      if (!segment.escaped && segment.value === "..") {
+        if (current.linkPath.length > 0) current = this.resolveLinkPath(view, current.linkPath.slice(0, -1));
+        continue;
+      }
+      const child = this.entries(view, current).find((entry) => entry.name === segment.value);
+      if (child === undefined) throw new RepositoryError("not_found", "path not found: " + rawPath);
+      current = child.child;
+    }
+    return current;
+  }
+
+  private resolveLinkPath(view: View, linkPath: Id[]): ResolvedNode {
+    let current = this.root(view);
+    for (const linkId of linkPath) current = this.resolveChild(view, current, linkId);
+    return current;
+  }
+
+  private referenceNode(session: Session, referenceRevision: number | undefined, rawPath: string): ResolvedNode {
+    if (referenceRevision === undefined || referenceRevision === session.headRevision) {
+      return this.resolvePath(this.resolveSession(session.id), rawPath || ".");
+    }
+    const revision = referenceRevision ?? session.headRevision;
+    const view = this.records.getSessionRevision(session.id, revision);
+    return this.resolvePathAt(view, this.root(view), rawPath || ".");
+  }
+
+  private findNode(view: View, nodeId: Id): ResolvedNode | null {
+    const visit = (node: ResolvedNode, visited: Set<Id>): ResolvedNode | null => {
+      if (node.nodeId === nodeId) return node;
+      if (visited.has(node.nodeId)) return null;
+      visited.add(node.nodeId);
+      for (const { child } of this.entries(view, node)) {
+        const found = visit(child, visited);
+        if (found !== null) return found;
+      }
+      return null;
+    };
+    return visit(this.root(view), new Set());
+  }
+
+  private walk(view: View, node: ResolvedNode, visited = new Set<Id>()): ResolvedNode[] {
+    if (visited.has(node.nodeId)) return [];
+    visited.add(node.nodeId);
+    return [node, ...this.entries(view, node).flatMap(({ child }) => this.walk(view, child, visited))];
+  }
+
+  private hasOpenDescendant(view: View, node: ResolvedNode, visited: Set<Id>): boolean {
+    for (const { child } of this.entries(view, node)) {
+      if (!terminal.has(child.record.attributes.status)) return true;
+      if (!visited.has(child.nodeId)) {
+        visited.add(child.nodeId);
+        if (this.hasOpenDescendant(view, child, visited)) return true;
+      }
+    }
+    return false;
+  }
+
+  private linkLocation(view: View, linkId: Id): LinkLocation | null {
+    try {
+      const link = this.records.resolveLinkRecord(linkId, view);
+      return { parentNodeId: link.parentNodeId, name: link.name };
+    } catch (error) {
+      if (error instanceof RepositoryError && error.code === "not_found") return null;
+      throw error;
+    }
+  }
+
+  private semanticChanges(
+    view: View,
+    previous: { view: View; node: ResolvedNode; location: LinkLocation | null } | null,
+    current: { node: ResolvedNode; location: LinkLocation | null },
+  ): Array<"work" | "children" | "renamed" | "moved"> {
+    if (previous === null) return ["work", "children"];
+    const changes: Array<"work" | "children" | "renamed" | "moved"> = [];
+    if (JSON.stringify(previous.node.record.attributes) !== JSON.stringify(current.node.record.attributes)) changes.push("work");
+    const beforeChildren = this.entries(previous.view, previous.node).map((entry) => [entry.child.linkId, entry.name]);
+    const afterChildren = this.entries(view, current.node).map((entry) => [entry.child.linkId, entry.name]);
+    if (JSON.stringify(beforeChildren) !== JSON.stringify(afterChildren)) changes.push("children");
+    if (previous.location !== null && current.location !== null) {
+      if (previous.location.parentNodeId === current.location.parentNodeId && previous.location.name !== current.location.name) changes.push("renamed");
+      if (previous.location.parentNodeId !== current.location.parentNodeId) changes.push("moved");
+    }
     return changes;
   }
 
-  private createNode(fields: WorkFields): NodeRevision {
-    const nodeId = this.records.createNode();
-    const payload = this.records.insertPayloadRevision(nodeId, null, fields);
-    const directory = this.records.insertDirectoryRevision(nodeId, null, []);
-    return this.records.insertNodeRevision(nodeId, null, payload.id, directory.id);
-  }
-
-  private resolved(nodeRevision: NodeRevision, entryPath: Id[], names: string[]): ResolvedNode {
-    return {
-      nodeRevision,
-      payload: this.records.getPayloadRevision(nodeRevision.payloadRevisionId),
-      directory: this.records.getDirectoryRevision(nodeRevision.directoryRevisionId),
-      memberships: this.records.listMemberships(nodeRevision.directoryRevisionId),
-      entryPath,
-      names,
-    };
-  }
-
-  private resolveEntryPath(resolved: ResolvedSession, path: Id[]): ResolvedNode {
-    const root = resolved.nodes[0];
-    if (!root) throw new RepositoryError("invariant", "missing root");
-    let current = root;
-    for (const entryId of path) {
-      const membership = current.memberships.find((item) =>
-        this.records.getEntryRevision(item.entryRevisionId).entryId === entryId
-      );
-      if (!membership) throw new RepositoryError("not_found", "entry path is not reachable");
-      const entry = this.records.getEntryRevision(membership.entryRevisionId);
-      current = this.resolved(
-        this.records.getNodeRevision(membership.childNodeRevisionId),
-        [...current.entryPath, entryId],
-        [...current.names, entry.name],
-      );
-    }
-    return current;
-  }
-
-  private resolveMoveDestination(
-    resolved: ResolvedSession,
-    rawDestination: string,
-    sourceName: string,
-  ): { parent: ResolvedNode; name: string } {
+  private resolveMoveDestination(resolved: ResolvedSession, rawDestination: string, sourceName: string): { parent: ResolvedNode; name: string } {
     try {
-      return {
-        parent: this.resolvePath(resolved, rawDestination),
-        name: sourceName,
-      };
+      return { parent: this.resolvePath(resolved, rawDestination), name: sourceName };
     } catch (error) {
       if (!(error instanceof RepositoryError) || error.code !== "not_found") throw error;
     }
     const absolute = rawDestination.startsWith("/");
     const segments = this.parsePath(rawDestination);
     const final = segments.pop();
-    if (!final || (!final.escaped && (final.value === "." || final.value === ".."))) {
+    if (final === undefined || (!final.escaped && (final.value === "." || final.value === ".."))) {
       throw new RepositoryError("invariant", "destination must name a directory or new entry");
     }
-    const parentPath = (absolute ? "/" : "") + segments.map((segment) =>
-      this.escapeName(segment.value)
-    ).join("/");
-    return {
-      parent: this.resolvePath(resolved, parentPath || (absolute ? "/" : ".")),
-      name: this.normalizeName(final.value),
-    };
+    const parentPath = (absolute ? "/" : "") + segments.map((segment) => this.escapeName(segment.value)).join("/");
+    return { parent: this.resolvePath(resolved, parentPath || (absolute ? "/" : ".")), name: this.normalizeName(final.value) };
   }
 
-  private rewriteDirectories(
-    rootNodeRevisionId: Id,
-    edits: Map<string, DirectoryEdit>,
-  ): Id {
-    const walk = (nodeRevisionId: Id, path: Id[]): Id => {
-      const node = this.records.getNodeRevision(nodeRevisionId);
-      const directory = this.records.getDirectoryRevision(node.directoryRevisionId);
-      const memberships = this.records.listMemberships(directory.id);
-      const childIds = new Set<Id>();
-      for (const editPath of edits.keys()) {
-        const parsed = this.keyPath(editPath);
-        if (parsed.length > path.length && this.startsWith(parsed.slice(0, path.length), path)) {
-          childIds.add(this.valueAt(parsed, path.length, "path edit is missing a child entry"));
-        }
-      }
-      let changed = false;
-      let next = memberships.map((membership) => {
-        const entry = this.records.getEntryRevision(membership.entryRevisionId);
-        if (!childIds.has(entry.entryId)) return membership;
-        const childRevisionId = walk(
-          membership.childNodeRevisionId,
-          [...path, entry.entryId],
-        );
-        if (childRevisionId === membership.childNodeRevisionId) return membership;
-        changed = true;
-        return { ...membership, childNodeRevisionId: childRevisionId };
-      });
-      const local = edits.get(this.pathKey(path));
-      if (local) {
-        changed = true;
-        next = next.filter((membership) => !local.remove.has(
-          this.records.getEntryRevision(membership.entryRevisionId).entryId,
-        ));
-        next = [...next, ...local.add];
-        this.ensureUniqueMembershipNames(next);
-      }
-      if (!changed) return nodeRevisionId;
-      const nextDirectory = this.records.insertDirectoryRevision(
-        node.nodeId,
-        directory,
-        next.map((membership, position) => ({ ...membership, position })),
-      );
-      return this.records.insertNodeRevision(
-        node.nodeId,
-        node,
-        node.payloadRevisionId,
-        nextDirectory.id,
-      ).id;
-    };
-    return walk(rootNodeRevisionId, []);
-  }
-
-  private replaceNodeAtPath(rootNodeRevisionId: Id, entryPath: Id[], replacementId: Id): Id {
-    if (entryPath.length === 0) {
-      return replacementId;
-    }
-
-    const parentPath = entryPath.slice(0, -1);
-    const targetEntryId = this.valueAt(
-      entryPath,
-      entryPath.length - 1,
-      "replacement target is missing",
-    );
-    return this.replaceChild(
-      rootNodeRevisionId,
-      parentPath,
-      targetEntryId,
-      replacementId,
-    );
-  }
-
-  private replaceChild(
-    rootNodeRevisionId: Id,
-    parentPath: Id[],
-    entryId: Id,
-    replacementId: Id,
-  ): Id {
-    const walk = (nodeRevisionId: Id, depth: number): Id => {
-      const node = this.records.getNodeRevision(nodeRevisionId);
-      const directory = this.records.getDirectoryRevision(node.directoryRevisionId);
-      const memberships = this.records.listMemberships(directory.id);
-      let changed = false;
-      const next = memberships.map((membership) => {
-        const entry = this.records.getEntryRevision(membership.entryRevisionId);
-        if (depth === parentPath.length && entry.entryId === entryId) {
-          changed = true;
-          return { ...membership, childNodeRevisionId: replacementId };
-        }
-        if (depth < parentPath.length && entry.entryId === parentPath[depth]) {
-          const child = walk(membership.childNodeRevisionId, depth + 1);
-          if (child !== membership.childNodeRevisionId) {
-            changed = true;
-            return { ...membership, childNodeRevisionId: child };
-          }
-        }
-        return membership;
-      });
-      if (!changed) return nodeRevisionId;
-      const nextDirectory = this.records.insertDirectoryRevision(node.nodeId, directory, next);
-      return this.records.insertNodeRevision(
-        node.nodeId,
-        node,
-        node.payloadRevisionId,
-        nextDirectory.id,
-      ).id;
-    };
-    return walk(rootNodeRevisionId, 0);
-  }
-
-  private hasOpenDescendant(nodeRevisionId: Id): boolean {
-    const node = this.records.getNodeRevision(nodeRevisionId);
-    const memberships = this.records.listMemberships(node.directoryRevisionId);
-    return memberships.some((membership) => {
-      const child = this.records.getNodeRevision(membership.childNodeRevisionId);
-      const payload = this.records.getPayloadRevision(child.payloadRevisionId);
-      return !terminal.has(payload.status) || this.hasOpenDescendant(child.id);
-    });
-  }
-
-  private walk(nodeRevisionId: Id, path: Id[] = [], names: string[] = []): ResolvedNode[] {
-    const current = this.resolved(this.records.getNodeRevision(nodeRevisionId), path, names);
-    return [
-      current,
-      ...current.memberships.flatMap((membership) => {
-        const entry = this.records.getEntryRevision(membership.entryRevisionId);
-        return this.walk(
-          membership.childNodeRevisionId,
-          [...path, entry.entryId],
-          [...names, entry.name],
-        );
-      }),
-    ];
-  }
-
-  private addDirectoryEdit(edits: Map<string, DirectoryEdit>, path: Id[], change: DirectoryEdit): void {
-    const key = this.pathKey(path);
-    const existing = edits.get(key);
-    if (!existing) {
-      edits.set(key, change);
-      return;
-    }
-    change.remove.forEach((entryId) => existing.remove.add(entryId));
-    existing.add.push(...change.add);
-  }
-
-  private repairMovedCursor(cursor: Id[], source: Id[], destination: Id[]): Id[] {
-    if (!this.startsWith(cursor, source)) return cursor;
-    return [...destination, ...cursor.slice(source.length)];
-  }
-
-  private ensureNameAvailable(memberships: Membership[], name: string): void {
-    if (memberships.some((membership) =>
-      this.records.getEntryRevision(membership.entryRevisionId).name === name
-    )) {
+  private ensureMoveName(view: View, parent: ResolvedNode, sourceLinkId: Id, name: string): void {
+    if (this.entries(view, parent).some((entry) => entry.child.linkId !== sourceLinkId && entry.name === name)) {
       throw new RepositoryError("conflict", "directory already contains: " + name);
     }
   }
 
-  private ensureUniqueMembershipNames(memberships: Membership[]): void {
-    const names = new Set<string>();
-    for (const membership of memberships) {
-      const name = this.records.getEntryRevision(membership.entryRevisionId).name;
-      if (names.has(name)) throw new RepositoryError("conflict", "directory already contains: " + name);
-      names.add(name);
-    }
+  private ensureNameAvailable(entries: Array<{ name: string }>, name: string): void {
+    if (entries.some((entry) => entry.name === name)) throw new RepositoryError("conflict", "directory already contains: " + name);
+  }
+
+  private repairMovedCursor(cursor: Id[], source: Id[], destination: Id[]): Id[] {
+    return this.startsWith(cursor, source) ? [...destination, ...cursor.slice(source.length)] : cursor;
+  }
+
+  private startsWith(value: Id[], prefix: Id[]): boolean {
+    return prefix.every((part, index) => value[index] === part);
   }
 
   private parsePath(rawPath: string): PathSegment[] {
@@ -733,19 +483,15 @@ export class ContinuationModel {
         current += character;
         escaped = false;
         hasEscape = true;
-        continue;
-      }
-      if (character === "\\") {
+      } else if (character === "\\") {
         escaped = true;
-        continue;
-      }
-      if (character === "/") {
+      } else if (character === "/") {
         if (current) segments.push({ value: this.normalizeName(current), escaped: hasEscape });
         current = "";
         hasEscape = false;
-        continue;
+      } else {
+        current += character;
       }
-      current += character;
     }
     if (escaped) throw new RepositoryError("invariant", "path ends with an escape");
     if (current) segments.push({ value: this.normalizeName(current), escaped: hasEscape });
@@ -763,40 +509,15 @@ export class ContinuationModel {
     return escaped === "." || escaped === ".." ? "\\" + escaped : escaped;
   }
 
-  private pathKey(path: Id[]): string {
-    return path.join(",");
-  }
-
-  private keyPath(key: string): Id[] {
-    return key ? key.split(",").map((value) => IdSchema.parse(Number(value))) : [];
-  }
-
-  private startsWith(value: Id[], prefix: Id[]): boolean {
-    return prefix.every((entry, index) => value[index] === entry);
+  private emptyWork(): WorkFields {
+    return WorkFieldsSchema.parse({});
   }
 
   private mergeWork(base: WorkFields, patch: WorkPatch): WorkFields {
     return WorkFieldsSchema.parse({ ...base, ...patch });
   }
 
-  private emptyWork(): WorkFields {
-    return WorkFieldsSchema.parse({});
-  }
-
   private timestamp(): string {
     return new Date().toISOString();
-  }
-
-  private canonicalWorkspacePath(cwd: string): string {
-    const absolutePath = resolve(cwd);
-    return platform() === "win32" ? absolutePath.toLowerCase() : absolutePath;
-  }
-
-  private valueAt<T>(values: readonly T[], index: number, message: string): T {
-    if (index < 0 || index >= values.length) {
-      throw new RepositoryError("invariant", message);
-    }
-
-    return values[index];
   }
 }

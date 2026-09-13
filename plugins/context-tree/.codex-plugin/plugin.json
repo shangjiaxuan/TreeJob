@@ -1,6 +1,6 @@
 {
   "name": "context-tree",
-  "version": "0.3.0",
+  "version": "0.6.0",
   "description": "Persistent filesystem-style continuation state for Codex sessions.",
   "author": { "name": "TreeContext" },
   "mcpServers": "./.mcp.json",

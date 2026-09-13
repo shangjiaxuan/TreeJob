@@ -1,4 +1,4 @@
-import type { EntrySummary, NodeRevisionSummary } from "./schema.js";
+import type { EntrySummary, RevisionSummary } from "./schema.js";
 import type { BrowserTreeEntry, BrowserView } from "./browse-data.js";
 
 export function renderLoginPage(message = ""): string {
@@ -18,10 +18,10 @@ export function renderLoginPage(message = ""): string {
 
 export function renderBrowsePage(result: BrowserView): string {
   const currentPath = result.currentPath;
-  const selectedRevisionId = result.selectedRevision.revisionId;
-  const tree = renderTree(result.tree, currentPath);
+  const selectedRevisionId = result.selectedRevision.revision;
+  const tree = renderTree(result.tree, currentPath, selectedRevisionId);
   const revisions = result.revisions.map((revision) =>
-    renderRevision(revision, currentPath, selectedRevisionId)
+    renderRevision(revision, currentPath, selectedRevisionId, result.referenceRevision)
   ).join("");
   const entries = renderEntries(result.entries);
   const work = escapeHtml(JSON.stringify(result.work, null, 2));
@@ -47,26 +47,27 @@ export function renderBrowsePage(result: BrowserView): string {
   );
 }
 
-function renderTree(node: BrowserTreeEntry, currentPath: string): string {
+function renderTree(node: BrowserTreeEntry, currentPath: string, revision: number): string {
   const children = node.children.length === 0
     ? ""
-    : "<ul>" + node.children.map((child) => renderTree(child, currentPath)).join("") + "</ul>";
+    : "<ul>" + node.children.map((child) => renderTree(child, currentPath, revision)).join("") + "</ul>";
   const selected = node.path === currentPath ? " class=\"selected\"" : "";
   const label = node.name === "/" ? "/" : node.name;
   const detail = node.title ? " <small>" + escapeHtml(node.title) + "</small>" : "";
 
-  return "<li" + selected + "><a href=\"" + browseUrl(node.path) + "\">" +
+  return "<li" + selected + "><a href=\"" + browseUrl(node.path, revision, revision) + "\">" +
     escapeHtml(label) + "</a>" + detail + children + "</li>";
 }
 
 function renderRevision(
-  revision: NodeRevisionSummary,
+  revision: RevisionSummary,
   path: string,
   selectedRevisionId: number,
+  referenceRevision: number,
 ): string {
-  const selected = revision.revisionId === selectedRevisionId ? " class=\"selected\"" : "";
-  return "<li" + selected + "><a href=\"" + browseUrl(path, revision.revisionId) + "\">" +
-    "#" + revision.revisionId + "</a><br><small>" +
+  const selected = revision.revision === selectedRevisionId ? " class=\"selected\"" : "";
+  return "<li" + selected + "><a href=\"" + browseUrl(path, revision.revision, referenceRevision) + "\">" +
+    "r" + revision.revision + "</a><br><small>" +
     escapeHtml(revision.changes.join(", ")) + "<br>" +
     escapeHtml(revision.createdAt) + "</small></li>";
 }
@@ -93,11 +94,13 @@ function renderEntries(entries: EntrySummary[]): string {
   ).join("") + "</ul>";
 }
 
-function browseUrl(path: string, revisionId?: number): string {
+function browseUrl(path: string, revision?: number, reference?: number): string {
   const encodedPath = path.split("/").map((segment) =>
     encodeURIComponent(segment)
   ).join("/");
-  const query = revisionId === undefined ? "" : "?revision=" + revisionId;
+  const query = revision === undefined
+    ? ""
+    : "?revision=" + revision + (reference === undefined ? "" : "&reference=" + reference);
   return "/browse" + (encodedPath || "/") + query;
 }
 
