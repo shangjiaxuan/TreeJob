@@ -5,16 +5,16 @@ import { homedir, platform } from "node:os";
 import { join } from "node:path";
 import net from "node:net";
 import { fileURLToPath } from "node:url";
-import { z } from "zod";
 import {
+  CommandInputSchema,
+  JsonSchema,
   OperationSchemas,
   PROTOCOL_VERSION,
   RpcFailureSchema,
   RpcSuccessSchema,
   schemaDigest,
-  type OperationInput,
-  type OperationName,
-  type OperationOutput,
+  type CommandInput,
+  type RpcMethod,
 } from "./schema.js";
 
 export function dataDir(): string {
@@ -52,54 +52,28 @@ export function daemonEntry(): string {
   return fileURLToPath(new URL("./daemon.mjs", import.meta.url));
 }
 
-export async function call<N extends OperationName>(
-  method: N,
-  params: OperationInput<N>,
-  timeout = 8_000,
-  idempotencyKey?: string,
-): Promise<OperationOutput<N>> {
-  const directory = dataDir();
-  mkdirSync(directory, { recursive: true });
-
-  try {
-    await hello();
-    const response = await send(method, params, timeout, idempotencyKey);
-    return parseOperationOutput(method, response);
-  } catch {
-    await startDaemon(directory);
-    const response = await send(method, params, timeout, idempotencyKey);
-    return parseOperationOutput(method, response);
-  }
-}
-
-/**
- * Invoke an operation selected at runtime. This is for protocol views such as
- * the development shell: its operation name and object are not synthesized or
- * reinterpreted by a second command language.
- */
-export async function callRaw(
-  method: OperationName,
-  rawParams: unknown,
+export async function callCommand(
+  raw: CommandInput,
   timeout = 8_000,
   idempotencyKey?: string,
 ): Promise<unknown> {
-  const params = OperationSchemas[method].input.parse(rawParams);
+  const params = CommandInputSchema.parse(raw);
   const directory = dataDir();
   mkdirSync(directory, { recursive: true });
 
   try {
     await hello();
-    const response = await send(method, params, timeout, idempotencyKey);
-    return OperationSchemas[method].output.parse(response);
+    const response = await send("command", params, timeout, idempotencyKey);
+    return JsonSchema.parse(response);
   } catch {
     await startDaemon(directory);
-    const response = await send(method, params, timeout, idempotencyKey);
-    return OperationSchemas[method].output.parse(response);
+    const response = await send("command", params, timeout, idempotencyKey);
+    return JsonSchema.parse(response);
   }
 }
 
 function send(
-  method: OperationName,
+  method: RpcMethod,
   params: unknown,
   timeout: number,
   idempotencyKey?: string,
@@ -158,20 +132,6 @@ function send(
   });
 }
 
-function parseOperationOutput<N extends OperationName>(
-  method: N,
-  raw: unknown,
-): OperationOutput<N> {
-  // TypeScript cannot preserve an indexed Zod schema's relation to a generic
-  // key. This is the single protocol-registry bridge; Zod still validates the
-  // runtime value before it crosses the RPC boundary.
-  const outputSchema = OperationSchemas[method].output as unknown as z.ZodType<
-    OperationOutput<N>
-  >;
-
-  return outputSchema.parse(raw);
-}
-
 async function hello(): Promise<void> {
   const response = await send(
     "hello",
@@ -182,7 +142,7 @@ async function hello(): Promise<void> {
     2_000,
   );
 
-  parseOperationOutput("hello", response);
+  OperationSchemas.hello.output.parse(response);
 }
 
 async function startDaemon(directory: string): Promise<void> {

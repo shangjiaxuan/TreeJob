@@ -177,9 +177,39 @@ The controller should not merely pass the model Context projection through to
 the protocol.
 
 The development shell remains a faithful protocol client: after the public
-protocol is compact, it should display that exact compact result. Its local
-help and exit utilities are acceptable exceptions to the command pass-through
-rule.
+protocol is compact, it should display that exact compact result. `exit` and
+`quit` remain local shell utilities. Daemon-owned `help` is deliberately not:
+it uses the same command envelope and lists the same public commands that MCP
+tool discovery exposes.
+
+## Unified command transport
+
+Protocol v3 exposes one MCP tool, `command`, and one non-handshake daemon RPC
+method with the same input shape:
+
+```json
+{
+  "sessionId": "session-123",
+  "command": ["mkdir", "detour", {"returnCondition":"Report findings"}]
+}
+```
+
+The first atom selects a filesystem operation. Remaining atoms are positional
+when their meaning is unambiguous; raw JSON objects and arrays carry structured
+payloads. Ambiguous optional values use normal long options, accepting both
+`--scope=workspace` and `--scope workspace`. The daemon owns argv validation
+and converts a command to an internal controller use case. The shell only
+lexes text into this JSON-compatible array; hooks construct the array directly.
+
+Shell quoting is a separate lexical layer from Context Tree path escaping:
+
+- double-quoted strings support `\"` and `\\`;
+- balanced `{...}` and `[...]` atoms are parsed as JSON;
+- other backslash sequences are preserved for the daemon path parser.
+
+`help` and `help <command>` are sessionless. All operational commands require
+a session ID. Internal lifecycle proposal submission uses the same transport
+but is intentionally absent from MCP discovery and help.
 
 ## Restore briefing
 
@@ -230,10 +260,18 @@ because record data can contain workspace paths, user text, and notes.
 The diagnostic log is separate from both the continuation SQLite database and
 the hook-journal database.
 
+## Read-only browser
+
+An optional loopback-only browser is a debugging view, not another persistence
+owner. It receives its session identity from a small local landing page, stores
+that identity in a `SameSite=Strict` cookie, and composes its page by calling
+the existing read-only filesystem commands (`ls`, `rev-list`, and `rev-show`).
+The browser-specific tree/page projection is therefore local adapter state,
+not a daemon contract. The HTTP adapter never opens SQLite or offers mutation
+routes.
+
 ## Deferred decisions
 
-- Exact public operation names and whether to version them as a breaking
-  protocol change.
 - Directory entry naming and disambiguation policy.
 - Whether briefing is one operation or a hook-specific projection.
 - Exact compact current-work fields and outcome presentation after back.

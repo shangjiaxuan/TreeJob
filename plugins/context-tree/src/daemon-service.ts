@@ -1,9 +1,11 @@
 import { z } from "zod";
+import { parseCommand } from "./commands.js";
 import { ContinuationModel, type ResolvedNode, type ResolvedSession } from "./continuation-model.js";
 import { RepositoryError, SqliteRecordRepository, type RecordRepository } from "./record-repository.js";
 import { writeDiagnostic } from "./diagnostics.js";
 import {
   OperationSchemas,
+  CommandInputSchema,
   PROTOCOL_VERSION,
   schemaDigest,
   type BriefingResult,
@@ -17,7 +19,6 @@ import {
   type PwdState,
   type RpcResponse,
   type WorkPatch,
-  JsonSchema,
 } from "./schema.js";
 
 type Mutation = { rootNodeRevisionId: Id; cursorEntryPath: Id[] };
@@ -30,16 +31,15 @@ export class ContinuationController {
     this.model = new ContinuationModel(records);
   }
 
-  describe() {
-    return {
-      protocolVersion: PROTOCOL_VERSION,
-      schemaDigest,
-      operations: Object.entries(OperationSchemas).map(([name, operation]) => ({
-        name,
-        inputSchema: JsonSchema.parse(z.toJSONSchema(operation.input)),
-        outputSchema: JsonSchema.parse(z.toJSONSchema(operation.output)),
-      })),
-    };
+  execute(raw: unknown, idempotencyKey?: string): unknown {
+    const input = CommandInputSchema.parse(raw);
+    const parsed = parseCommand(input);
+
+    if (parsed.kind === "help") {
+      return parsed.result;
+    }
+
+    return this.dispatch(parsed.name, parsed.input, idempotencyKey);
   }
 
   dispatch(name: OperationName, raw: unknown, idempotencyKey?: string): unknown {
@@ -71,7 +71,6 @@ export class ContinuationController {
   private dispatchValidated(name: OperationName, raw: unknown, key: string | null): unknown {
     switch (name) {
       case "hello": return this.hello(raw);
-      case "describe": OperationSchemas.describe.input.parse(raw); return this.describe();
       case "pwd": return this.pwd(raw, key);
       case "ls": return this.ls(raw);
       case "cd": return this.cd(raw, key);
@@ -286,6 +285,7 @@ export class ContinuationController {
     return this.model.entrySummaries(node).map(({ name, child }) => ({ name, kind: child.payload.kind, title: child.payload.title, status: child.payload.status, hasChildren: child.memberships.length > 0 }));
   }
 
+
   private entriesForRevision(revisionId: Id): EntrySummary[] {
     const revision = this.records.getNodeRevision(revisionId);
     const directory = this.records.getDirectoryRevision(revision.directoryRevisionId);
@@ -401,12 +401,12 @@ export class ContinuationController {
 export class FilesystemOperations {
   constructor(private readonly controller = new ContinuationController()) {}
 
-  describe() {
-    return this.controller.describe();
+  hello(raw: unknown): unknown {
+    return this.controller.dispatch("hello", raw);
   }
 
-  dispatch(name: OperationName, raw: unknown, idempotencyKey?: string): unknown {
-    return this.controller.dispatch(name, raw, idempotencyKey);
+  execute(raw: unknown, idempotencyKey?: string): unknown {
+    return this.controller.execute(raw, idempotencyKey);
   }
 
   failure(id: string, error: unknown): RpcResponse {

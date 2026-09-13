@@ -28,6 +28,7 @@ export class ContractRuntime {
     const schema = specification.kind === "object"
       ? this.compile(specification)
       : z.lazy(() => this.compile(specification));
+
     this.namedSchemas.set(name, schema);
 
     return schema;

@@ -4,7 +4,6 @@ import { existsSync, rmSync } from "node:fs";
 import { FilesystemOperations } from "./daemon-service.js";
 import { endpoint, releaseStartLock } from "./rpc.js";
 import {
-  OperationSchemas,
   PROTOCOL_VERSION,
   RpcRequestSchema,
 } from "./schema.js";
@@ -76,9 +75,9 @@ function writeResponse(socket: net.Socket, line: string): void {
   try {
     const request = RpcRequestSchema.parse(JSON.parse(line));
     id = request.id;
-    const result = OperationSchemas[request.method].output.parse(
-      controller.dispatch(request.method, request.params, request.idempotencyKey),
-    );
+    const result = request.method === "hello"
+      ? controller.hello(request.params)
+      : controller.execute(request.params, request.idempotencyKey);
     socket.write(JSON.stringify({
       protocolVersion: PROTOCOL_VERSION,
       id,

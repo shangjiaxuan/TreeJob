@@ -14,6 +14,9 @@ export type JsonValue =
   | { [key: string]: JsonValue };
 
 /** @schema */
+export type CommandAtom = JsonValue;
+
+/** @schema */
 export type RecordStatus =
   | "open"
   | "blocked"
@@ -296,8 +299,30 @@ export interface SubmitProposalInput extends SessionInput {
 }
 
 /** @schema @strict */
+export interface CommandInput {
+  /** Required for every command except help. */
+  sessionId?: string;
+
+  /** @minItems 1 */
+  command: CommandAtom[];
+}
+
+/** @schema @strict */
+export interface CommandHelpEntry {
+  name: string;
+  description: string;
+  usage: string;
+}
+
+/** @schema @strict */
+export interface CommandHelpResult {
+  commands?: CommandHelpEntry[];
+  command?: CommandHelpEntry;
+}
+
+/** @schema @strict */
 export interface HelloInput {
-  protocolVersion: 2;
+  protocolVersion: 3;
 
   /** @minLength 1 */
   schemaDigest: string;
@@ -305,28 +330,14 @@ export interface HelloInput {
 
 /** @schema @strict */
 export interface HelloOutput {
-  protocolVersion: 2;
+  protocolVersion: 3;
   schemaDigest: string;
   daemon: string;
 }
 
 /** @schema @strict */
-export interface DescribeOperation {
-  name: string;
-  inputSchema: JsonValue;
-  outputSchema: JsonValue;
-}
-
-/** @schema @strict */
-export interface DescribeOutput {
-  protocolVersion: 2;
-  schemaDigest: string;
-  operations: DescribeOperation[];
-}
-
 export interface OperationContracts {
   hello: { input: HelloInput; output: HelloOutput; command: false };
-  describe: { input: Record<string, never>; output: DescribeOutput; command: false };
   pwd: { input: PwdInput; output: PwdState; command: true };
   ls: { input: PathInput; output: ListResult; command: false };
   cd: { input: CdInput; output: CursorState; command: true };
@@ -356,6 +367,9 @@ export interface OperationContracts {
 export type OperationName = keyof OperationContracts;
 
 /** @schema */
+export type RpcMethod = "hello" | "command";
+
+/** @schema */
 export type RpcErrorCode =
   | "validation"
   | "unsupported_protocol"
@@ -373,7 +387,7 @@ export interface RpcError {
 
 /** @schema @strict */
 export interface RpcRequest {
-  protocolVersion: 2;
+  protocolVersion: 3;
 
   /** @minLength 1 */
   id: string;
@@ -381,13 +395,13 @@ export interface RpcRequest {
   /** @minLength 1 */
   idempotencyKey?: string;
 
-  method: OperationName;
+  method: RpcMethod;
   params: JsonValue;
 }
 
 /** @schema @strict */
 export interface RpcSuccess {
-  protocolVersion: 2;
+  protocolVersion: 3;
   id: string;
   ok: true;
   result: JsonValue;
@@ -395,7 +409,7 @@ export interface RpcSuccess {
 
 /** @schema @strict */
 export interface RpcFailure {
-  protocolVersion: 2;
+  protocolVersion: 3;
   id: string;
   ok: false;
   error: RpcError;

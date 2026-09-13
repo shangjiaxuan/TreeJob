@@ -6,8 +6,8 @@ import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { renderAncestorBriefing, renderMinimalPath } from "./briefing.js";
-import { call, dataDir } from "./rpc.js";
-import { WorkPatchSchema } from "./schema.js";
+import { callCommand, dataDir } from "./rpc.js";
+import { BriefingResultSchema, JsonSchema, PwdStateSchema, WorkPatchSchema, type CommandAtom } from "./schema.js";
 
 const HookEventSchema = z.object({
   hook_event_name: z.string().optional(),
@@ -44,49 +44,56 @@ async function handleEvent(value: HookEvent, hookJournal: HookJournal): Promise<
 
 async function sessionStart(value: HookEvent): Promise<void> {
   const id = sessionId(value);
-  await call("pwd", { sessionId: id, cwd: value.cwd ?? process.cwd() }, 8_000, eventKey(value, "SessionStart"));
-  const briefing = await call("briefing", { sessionId: id });
+  await command(id, ["pwd", value.cwd ?? process.cwd()], 8_000, eventKey(value, "SessionStart"));
+  const briefing = BriefingResultSchema.parse(await command(id, ["briefing"]));
   writeOutput(renderMinimalPath(briefing) + "\n\n" + renderAncestorBriefing(briefing));
 }
 
 async function subagentStart(value: HookEvent): Promise<void> {
   const parent = sessionId(value);
   const child = subagentSessionId(value);
-  await call("fork", { sessionId: parent, newSessionId: child }, 8_000, eventKey(value, "SubagentStart"));
-  const briefing = await call("briefing", { sessionId: child });
+  await command(parent, ["fork", child], 8_000, eventKey(value, "SubagentStart"));
+  const briefing = BriefingResultSchema.parse(await command(child, ["briefing"]));
   writeOutput(renderMinimalPath(briefing) + "\n\n" + renderAncestorBriefing(briefing));
 }
 
 async function subagentStop(value: HookEvent): Promise<void> {
-  await call("submit-proposal", {
-    sessionId: sessionId(value),
+  await command(sessionId(value), ["_submit-proposal", {
     kind: "subagent_result",
     sourceSessionId: subagentSessionId(value),
     patch: { currentState: value.last_assistant_message ?? "Subagent completed; inspect its frozen branch." },
-  }, 8_000, eventKey(value, "SubagentStop"));
+  }], 8_000, eventKey(value, "SubagentStop"));
   writeOutput(undefined, "Context Tree saved a subagent proposal.");
 }
 
 async function preCompact(value: HookEvent, hookJournal: HookJournal): Promise<void> {
   const id = sessionId(value);
-  const state = await call("pwd", { sessionId: id });
+  const state = PwdStateSchema.parse(await command(id, ["pwd"]));
   const transcript = readTranscriptDelta(value.transcript_path);
   const candidate = summarizeCompact(state.current_work, transcript.delta);
   if (candidate.success) {
-    await call("submit-proposal", {
-      sessionId: id,
+    await command(id, ["_submit-proposal", {
       kind: "compact",
-      patch: candidate.data,
-    }, 120_000, eventKey(value, "PreCompact"));
+      patch: JsonSchema.parse(candidate.data),
+    }], 120_000, eventKey(value, "PreCompact"));
   }
   recordCompactAttempt(hookJournal, value, transcript.path, transcript.size, transcript.delta, candidate.success ? "" : "compact worker unavailable");
 }
 
 async function stop(value: HookEvent): Promise<void> {
-  const briefing = await call("briefing", { sessionId: sessionId(value) });
+  const briefing = BriefingResultSchema.parse(await command(sessionId(value), ["briefing"]));
   if (briefing.unresolvedCount > 0) {
     writeOutput(undefined, "Context Tree: " + briefing.unresolvedCount + " node(s) remain open or blocked.");
   }
+}
+
+function command(
+  sessionId: string,
+  command_: readonly CommandAtom[],
+  timeout = 8_000,
+  idempotencyKey?: string,
+): Promise<unknown> {
+  return callCommand({ sessionId, command: [...command_] }, timeout, idempotencyKey);
 }
 
 function summarizeCompact(current: unknown, delta: string) {

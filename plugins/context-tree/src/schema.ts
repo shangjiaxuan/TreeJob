@@ -2,12 +2,15 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import type {
   BriefingResult,
+  CommandAtom,
+  CommandHelpEntry,
+  CommandHelpResult,
+  CommandInput,
   CloseInput,
   CursorState,
   CurrentDirectory,
   CurrentWork,
   DecideProposalInput,
-  DescribeOutput,
   EditInput,
   EntrySummary,
   ForkInput,
@@ -38,10 +41,12 @@ import type {
   RevisionShowInput,
   RevisionShowResult,
   RpcFailure,
+  RpcMethod,
   RpcRequest,
   RpcResponse,
   RpcSuccess,
   SearchInput,
+  SearchScope,
   SearchResult,
   SessionInput,
   SubmitProposalInput,
@@ -52,7 +57,7 @@ import type {
 import { contractMetadata } from "./generated/contracts-metadata.js";
 import { ContractRuntime } from "./schema-runtime.js";
 
-export const PROTOCOL_VERSION = 2 as const;
+export const PROTOCOL_VERSION = 3 as const;
 
 const runtime = new ContractRuntime(contractMetadata);
 
@@ -63,24 +68,36 @@ function typedSchema<T>(name: string): z.ZodType<T> {
 export const IdSchema = typedSchema<Id>("Id");
 export const TimestampSchema = typedSchema<Timestamp>("Timestamp");
 export const JsonSchema = typedSchema<JsonValue>("JsonValue");
+export const CommandInputSchema = typedSchema<CommandInput>("CommandInput");
+export const CommandHelpEntrySchema = typedSchema<CommandHelpEntry>("CommandHelpEntry");
+export const CommandHelpResultSchema = typedSchema<CommandHelpResult>("CommandHelpResult");
 export const StatusSchema = typedSchema<RecordStatus>("RecordStatus");
 export const ReferenceSchema = typedSchema<Reference>("Reference");
 export const WorkFieldsSchema = typedSchema<WorkFields>("WorkFields");
 export const WorkPatchSchema = typedSchema<WorkPatch>("WorkPatch");
 export const PwdStateSchema = typedSchema<PwdState>("PwdState");
 export const CursorStateSchema = typedSchema<CursorState>("CursorState");
+export const BriefingResultSchema = typedSchema<BriefingResult>("BriefingResult");
+export const ListResultSchema = typedSchema<ListResult>("ListResult");
+export const RevisionListResultSchema = typedSchema<RevisionListResult>("RevisionListResult");
+export const RevisionShowResultSchema = typedSchema<RevisionShowResult>("RevisionShowResult");
 export const ProposalSummarySchema = typedSchema<ProposalSummary>("ProposalSummary");
 export const ProposalKindSchema = typedSchema<ProposalKind>("ProposalKind");
 export const ProposalStatusSchema = typedSchema<ProposalStatus>("ProposalStatus");
+export const ProposalDecisionSchema = typedSchema<ProposalDecision>("ProposalDecision");
+export const SearchScopeSchema = typedSchema<SearchScope>("SearchScope");
 
 export type {
   BriefingResult,
+  CommandAtom,
+  CommandHelpEntry,
+  CommandHelpResult,
+  CommandInput,
   CloseInput,
   CursorState,
   CurrentDirectory,
   CurrentWork,
   DecideProposalInput,
-  DescribeOutput,
   EditInput,
   EntrySummary,
   ForkInput,
@@ -110,10 +127,12 @@ export type {
   RevisionShowInput,
   RevisionShowResult,
   RpcFailure,
+  RpcMethod,
   RpcRequest,
   RpcResponse,
   RpcSuccess,
   SearchInput,
+  SearchScope,
   SearchResult,
   SessionInput,
   SubmitProposalInput,
@@ -150,7 +169,6 @@ function operation<N extends OperationName>(name: N): OperationSchema<N> {
 
 export const OperationSchemas = {
   hello: operation("hello"),
-  describe: operation("describe"),
   pwd: operation("pwd"),
   ls: operation("ls"),
   cd: operation("cd"),
@@ -169,14 +187,19 @@ export const OperationSchemas = {
 } satisfies { [N in OperationName]: OperationSchema<N> };
 
 export const OperationNameSchema = typedSchema<OperationName>("OperationName");
+export const RpcMethodSchema = typedSchema<RpcMethod>("RpcMethod");
 export const RpcRequestSchema = typedSchema<RpcRequest>("RpcRequest");
 export const RpcSuccessSchema = typedSchema<RpcSuccess>("RpcSuccess");
 export const RpcFailureSchema = typedSchema<RpcFailure>("RpcFailure");
 export const RpcResponseSchema = typedSchema<RpcResponse>("RpcResponse");
 
 export const schemaDigest = createHash("sha256").update(
-  Object.entries(OperationSchemas).map(([name, operation]) =>
+  [
+    "CommandInput:" + JSON.stringify(z.toJSONSchema(CommandInputSchema)),
+    "RpcRequest:" + JSON.stringify(z.toJSONSchema(RpcRequestSchema)),
+    ...Object.entries(OperationSchemas).map(([name, operation]) =>
     name + ":" + JSON.stringify(z.toJSONSchema(operation.input)) + ":" +
       JSON.stringify(z.toJSONSchema(operation.output))
-  ).join("\n"),
+    ),
+  ].join("\n"),
 ).digest("hex");

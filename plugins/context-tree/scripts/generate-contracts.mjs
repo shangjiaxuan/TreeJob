@@ -42,7 +42,7 @@ for (const [name, declaration] of declarations) {
 
 const operations = describeOperations(declarations.get("OperationContracts"));
 const metadata = {
-  version: 2,
+  version: 3,
   schemas,
   operations,
 };

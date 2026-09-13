@@ -5,11 +5,10 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import {
-  isExposedOperation,
   mcpTools,
 } from "./mcp-tools.js";
-import { call } from "./rpc.js";
-import { OperationSchemas } from "./schema.js";
+import { callCommand } from "./rpc.js";
+import { CommandInputSchema } from "./schema.js";
 
 const server = new Server(
   {
@@ -31,9 +30,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const operation = request.params.name;
-
-  if (!isExposedOperation(operation)) {
+  if (request.params.name !== "command") {
     return {
       content: [{
         type: "text",
@@ -44,10 +41,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   try {
-    const input = OperationSchemas[operation].input.parse(
+    const input = CommandInputSchema.parse(
       request.params.arguments ?? {},
     );
-    const result = await call(operation, input);
+    const result = await callCommand(input);
 
     return {
       content: [{

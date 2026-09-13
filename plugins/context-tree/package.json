@@ -8,6 +8,7 @@
     "generate": "node scripts/generate-contracts.mjs",
     "build": "node build.mjs",
     "shell": "npm run build && node dist/shell.mjs",
+    "browse": "npm run build && node dist/browse.mjs",
     "typecheck": "npm run generate && tsc --noEmit",
     "test": "npm run build && node --test dist/test/*.test.mjs",
     "validate": "node scripts/validate.mjs"

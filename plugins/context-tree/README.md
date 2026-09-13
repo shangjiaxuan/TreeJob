@@ -27,17 +27,38 @@ directory explicitly:
 
     npm run shell -- --data-dir C:/temp/context-tree-trial
 
+Pass `--session-id test_session` to reuse a known session ID; otherwise the
+shell generates one for its own lifetime.
+
+MCP exposes one tool, `command`. Its input is a session ID plus the same
+JSON-compatible command array used by hooks and the development shell:
+
+```json
+{
+  "sessionId": "notebook-trial",
+  "command": ["mkdir", "migration", {"objective": "Ship it"}]
+}
+```
+
 The shell prints the exact compact daemon result. Its commands are:
 
-    pwd --sessionId notebook-trial --cwd C:/work/repo
-    mkdir --sessionId notebook-trial --name migration --work '{"objective":"Ship it"}'
-    cd --sessionId notebook-trial --path migration
-    edit --sessionId notebook-trial --patch '{"currentState":"Checking schema safety"}'
-    rev-list --sessionId notebook-trial --path /migration
-    close --sessionId notebook-trial --summary "Checked migration safety" --status done
-    search --sessionId notebook-trial --query migration --scope subtree
-    describe
+    pwd C:/work/repo
+    mkdir migration {"objective":"Ship it"}
+    cd migration
+    edit {"currentState":"Checking schema safety"}
+    rev-list /migration
+    close done "Checked migration safety"
+    search migration --scope=workspace
+    help search
     quit
+
+The shell supplies one generated session ID for its lifetime. `help` is sent
+to the daemon without a session and lists only MCP-visible commands. Positional
+arguments are used where unambiguous. `search` accepts either
+`--scope=workspace` or `--scope workspace`. Use double quotes for strings with
+spaces; within them `\"` and `\\` escape a quote and backslash. JSON objects
+and arrays are raw, balanced JSON arguments. The shell preserves other
+backslash sequences for Context Tree path parsing.
 
 Paths use `/`; `\\` escapes literal `/`, `\\`, `.` and `..` names. Names are
 Unicode NFC and case-sensitive. `mv` retains node and entry identity for a
@@ -47,6 +68,24 @@ chronological node-revision line, labelling payload and directory changes.
 Set `CONTEXT_TREE_DEBUG=1` for daemon-owned JSONL diagnostics in the data
 directory. It logs operation metadata but not work content. Set
 `CONTEXT_TREE_DEBUG_CONTEXT=1` to include diagnostic result content.
+
+## Read-only browser
+
+Start the optional local browser with a random available port:
+
+    npm run browse
+
+Point it at a persisted Context Tree data directory, optionally with a fixed
+port:
+
+    npm run browse -- --data-dir C:/temp/context-tree-trial --port 48731
+
+It listens only on `127.0.0.1` and prints its address. The landing page asks
+for an existing Context Tree session ID, stores it in a local `HttpOnly`,
+`SameSite=Strict` cookie, and redirects to `/browse/`. Browse a node directly
+with `http://127.0.0.1:<port>/browse/<path>`; add `?revision=<id>` to inspect a
+historical revision of that node. The page is read-only and queries the daemon
+instead of opening SQLite.
 
 ## Runtime updates
 

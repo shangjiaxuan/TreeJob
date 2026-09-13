@@ -15,6 +15,7 @@ const bundles = [
   { entry: ["src", "mcp.ts"], output: ["dist", "mcp.mjs"] },
   { entry: ["src", "hook.ts"], output: ["dist", "hook.mjs"] },
   { entry: ["src", "shell.ts"], output: ["dist", "shell.mjs"] },
+  { entry: ["src", "browse.ts"], output: ["dist", "browse.mjs"] },
   { entry: ["test", "core.test.ts"], output: ["dist", "test", "core.test.mjs"] },
 ];
 
