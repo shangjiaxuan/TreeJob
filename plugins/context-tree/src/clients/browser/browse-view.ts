@@ -1,4 +1,4 @@
-import type { EntrySummary, RevisionSummary } from "./schema.js";
+import type { EntrySummary, RevisionSummary } from "../../protocol/schema.js";
 import type { BrowserTreeEntry, BrowserView } from "./browse-data.js";
 
 export function renderLoginPage(message = ""): string {

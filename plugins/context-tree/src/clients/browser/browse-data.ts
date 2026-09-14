@@ -1,4 +1,4 @@
-import { callCommand } from "./rpc.js";
+import { callCommand } from "../command-client.js";
 import {
   ListResultSchema,
   RevisionListResultSchema,
@@ -7,7 +7,7 @@ import {
   type EntrySummary,
   type RecordStatus,
   type RevisionSummary,
-} from "./schema.js";
+} from "../../protocol/schema.js";
 
 export type BrowserTreeEntry = {
   name: string;

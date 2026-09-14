@@ -18,7 +18,7 @@ as `{ sessionId: "session", command: ["mkdir", "investigate", {"returnCondition"
 - Treat the cursor as the active stack. Use `ls`, `cd`, `mkdir`, and `mv` for tree
   navigation; `close` pops to the parent. Request `briefing` after compact or a
   significant detour.
-- Public revisions are session snapshots (`r0`, `r1`, ...), not node IDs. Use
+- Public revisions are session revisions (`r0`, `r1`, ...), not node IDs. Use
   `rev-list [path]` for semantic history and `rev-show <revision> [path]` for a
   historical view. A path normally resolves at the current head, so it follows
   a moved or renamed node; add `--reference=N` only when a historical path is

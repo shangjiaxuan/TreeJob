@@ -45,14 +45,7 @@ export type ContractSpec = ContractConstraint & (
   }
 );
 
-export type OperationMetadata = {
-  input: ContractSpec;
-  output: ContractSpec;
-  command: ContractSpec;
-};
-
 export type ContractMetadata = {
-  version: 3;
+  version: 4;
   schemas: Record<string, ContractSpec>;
-  operations: Record<string, OperationMetadata>;
 };

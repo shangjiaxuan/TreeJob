@@ -1,4 +1,4 @@
-import type { BriefingResult, CursorState, Reference } from "./schema.js";
+import type { BriefingResult, CursorState, Reference } from "../../protocol/schema.js";
 
 export function renderMinimalPath(state: CursorState): string {
   return "CURRENT " + state.current_dir.path;

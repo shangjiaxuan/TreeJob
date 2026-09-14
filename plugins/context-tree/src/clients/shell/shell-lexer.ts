@@ -1,4 +1,4 @@
-import type { CommandAtom } from "./schema.js";
+import type { CommandAtom } from "../../protocol/schema.js";
 
 /**
  * Translate human shell text into the exact JSON-compatible argv array sent to

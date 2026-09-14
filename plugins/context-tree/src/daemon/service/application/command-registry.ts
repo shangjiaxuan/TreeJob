@@ -1,9 +1,8 @@
 import {
   CommandHelpResultSchema,
-  IdSchema,
-  OperationSchemas,
   ProposalDecisionSchema,
   ProposalKindSchema,
+  ProposalIdSchema,
   RevisionSchema,
   SearchScopeSchema,
   StatusSchema,
@@ -13,10 +12,10 @@ import {
   type CommandHelpResult,
   type CommandInput,
   type JsonValue,
-  type OperationName,
-} from "./schema.js";
+} from "../../../protocol/schema.js";
+import { OperationSchemas, type OperationName } from "./operation-schemas.js";
 
-type UseCaseName = Exclude<OperationName, "hello">;
+type UseCaseName = OperationName;
 
 type ParsedOperation = {
   kind: "operation";
@@ -109,21 +108,21 @@ const definitions: readonly CommandDefinition[] = [
   ),
   command(
     "rev-list",
-    "List snapshot history for the current node or a path.",
+    "List session revision history for the current node or a path.",
     "rev-list [path] [--reference=N]",
     "rev-list",
     (sessionId, args) => revisionListInput(sessionId, args),
   ),
   command(
     "rev-show",
-    "Show a path at a selected session snapshot revision.",
+    "Show a path at a selected historical session revision.",
     "rev-show <revision> [path] [--reference=N]",
     "rev-show",
     (sessionId, args) => revisionShowInput(sessionId, args),
   ),
   command(
     "fork",
-    "Create a frozen child session from the current snapshot.",
+    "Create a frozen child session from the current revision.",
     "fork <new-session-id>",
     "fork",
     (sessionId, args) => ({ sessionId, newSessionId: exactString(args, "new-session-id") }),
@@ -149,7 +148,7 @@ const definitions: readonly CommandDefinition[] = [
     "decide-proposal",
     (sessionId, args) => ({
       sessionId,
-      proposalId: id(args[0], "proposal-id"),
+      proposalId: proposalId(args[0], "proposal-id"),
       decision: ProposalDecisionSchema.parse(requiredString(args, 1, "decision")),
       replacement: optionalWorkPatch(args, 2),
     }),
@@ -415,21 +414,16 @@ function stringValue(value: JsonValue, label: string): string {
   return value;
 }
 
-function id(value: CommandAtom | undefined, label: string): number {
+function proposalId(value: CommandAtom | undefined, label: string): number {
   if (typeof value === "number") {
-    return IdSchema.parse(value);
+    return ProposalIdSchema.parse(value);
   }
 
   if (typeof value === "string" && /^\d+$/.test(value)) {
-    return IdSchema.parse(Number(value));
+    return ProposalIdSchema.parse(Number(value));
   }
 
   throw new Error(label + " must be an integer");
-}
-
-function optionId(options: ReadonlyMap<string, string>, name: string): number | undefined {
-  const value = options.get(name);
-  return value === undefined ? undefined : id(value, "--" + name);
 }
 
 function revision(value: CommandAtom | undefined, label: string): number {

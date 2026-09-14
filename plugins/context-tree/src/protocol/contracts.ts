@@ -1,5 +1,5 @@
 /** @schema @int @positive */
-export type Id = number;
+export type ProposalId = number;
 
 /** @schema @int @nonnegative */
 export type Revision = number;
@@ -161,7 +161,7 @@ export interface RevisionDetails {
 
 /** @schema @strict */
 export interface ProposalSummary {
-  proposalId: Id;
+  proposalId: ProposalId;
   kind: ProposalKind;
   status: ProposalStatus;
   createdAt: Timestamp;
@@ -261,104 +261,6 @@ export interface ForkResult extends CursorState {
 }
 
 /** @schema @strict */
-export interface SessionInput {
-  /** @minLength 1 */
-  sessionId: string;
-}
-
-/** @schema @strict */
-export interface PwdInput extends SessionInput {
-  cwd?: string;
-}
-
-/** @schema @strict */
-export interface PathInput extends SessionInput {
-  path?: string;
-}
-
-/** @schema @strict */
-export interface ListInput extends PathInput {
-  revision?: Revision;
-  reference?: Revision;
-}
-
-/** @schema @strict */
-export interface RevisionListInput extends PathInput {
-  reference?: Revision;
-}
-
-/** @schema @strict */
-export interface CdInput extends SessionInput {
-  /** @minLength 1 */
-  path: string;
-}
-
-/** @schema @strict */
-export interface MkdirInput extends SessionInput {
-  /** @minLength 1 */
-  name: string;
-  work?: WorkPatch;
-}
-
-/** @schema @strict */
-export interface EditInput extends SessionInput {
-  patch: WorkPatch;
-}
-
-/** @schema @strict */
-export interface MoveInput extends SessionInput {
-  /** @minLength 1 */
-  source: string;
-  /** @minLength 1 */
-  destination: string;
-}
-
-/** @schema @strict */
-export interface CloseInput extends SessionInput {
-  /** @minLength 1 */
-  summary: string;
-  /** @default done */
-  status: "done" | "abandoned" | "superseded";
-}
-
-/** @schema @strict */
-export interface SearchInput extends SessionInput {
-  /** @minLength 1 */
-  query: string;
-  /** @default subtree */
-  scope: SearchScope;
-  path?: string;
-}
-
-/** @schema @strict */
-export interface RevisionShowInput extends SessionInput {
-  revision: Revision;
-  path?: string;
-  reference?: Revision;
-}
-
-/** @schema @strict */
-export interface ForkInput extends SessionInput {
-  /** @minLength 1 */
-  newSessionId: string;
-}
-
-/** @schema @strict */
-export interface DecideProposalInput extends SessionInput {
-  proposalId: Id;
-  decision: ProposalDecision;
-  replacement?: WorkPatch;
-}
-
-/** @schema @strict */
-export interface SubmitProposalInput extends SessionInput {
-  kind: ProposalKind;
-  patch?: WorkPatch;
-  /** @minLength 1 */
-  sourceSessionId?: string;
-}
-
-/** @schema @strict */
 export interface CommandInput {
   /** Required for every command except help. */
   sessionId?: string;
@@ -378,83 +280,3 @@ export interface CommandHelpResult {
   commands?: CommandHelpEntry[];
   command?: CommandHelpEntry;
 }
-
-/** @schema @strict */
-export interface HelloInput {
-  protocolVersion: 5;
-  /** @minLength 1 */
-  schemaDigest: string;
-}
-
-/** @schema @strict */
-export interface HelloOutput {
-  protocolVersion: 5;
-  schemaDigest: string;
-  daemon: string;
-}
-
-/** @schema @strict */
-export interface OperationContracts {
-  hello: { input: HelloInput; output: HelloOutput; command: false };
-  pwd: { input: PwdInput; output: PwdState; command: true };
-  ls: { input: ListInput; output: ListResult; command: false };
-  cd: { input: CdInput; output: CdResult; command: true };
-  mkdir: { input: MkdirInput; output: MkdirResult; command: true };
-  edit: { input: EditInput; output: EditResult; command: true };
-  mv: { input: MoveInput; output: MoveResult; command: true };
-  close: { input: CloseInput; output: CloseResult; command: true };
-  search: { input: SearchInput; output: SearchResult; command: false };
-  "rev-list": { input: RevisionListInput; output: RevisionListResult; command: false };
-  "rev-show": { input: RevisionShowInput; output: RevisionShowResult; command: false };
-  fork: { input: ForkInput; output: ForkResult; command: true };
-  briefing: { input: SessionInput; output: BriefingResult; command: false };
-  proposals: { input: SessionInput; output: ProposalListResult; command: false };
-  "decide-proposal": { input: DecideProposalInput; output: ProposalDecisionResult; command: true };
-  "submit-proposal": { input: SubmitProposalInput; output: ProposalSummary; command: true };
-}
-
-/** @schema */
-export type OperationName = keyof OperationContracts;
-
-/** @schema */
-export type RpcMethod = "hello" | "command";
-
-/** @schema */
-export type RpcErrorCode = "validation" | "unsupported_protocol" | "not_found" | "conflict" | "invariant" | "internal";
-
-/** @schema @strict */
-export interface RpcError {
-  code: RpcErrorCode;
-  message: string;
-  details?: JsonValue;
-}
-
-/** @schema @strict */
-export interface RpcRequest {
-  protocolVersion: 5;
-  /** @minLength 1 */
-  id: string;
-  /** @minLength 1 */
-  idempotencyKey?: string;
-  method: RpcMethod;
-  params: JsonValue;
-}
-
-/** @schema @strict */
-export interface RpcSuccess {
-  protocolVersion: 5;
-  id: string;
-  ok: true;
-  result: JsonValue;
-}
-
-/** @schema @strict */
-export interface RpcFailure {
-  protocolVersion: 5;
-  id: string;
-  ok: false;
-  error: RpcError;
-}
-
-/** @schema */
-export type RpcResponse = RpcSuccess | RpcFailure;

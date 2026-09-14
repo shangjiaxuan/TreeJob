@@ -2,22 +2,23 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
-import { dataDir } from "./rpc.js";
 import {
-  IdSchema,
   JsonSchema,
   ProposalKindSchema,
   ProposalStatusSchema,
   WorkFieldsSchema,
   WorkPatchSchema,
-  type Id,
   type JsonValue,
   type ProposalKind,
   type ProposalStatus,
   type WorkFields,
   type WorkPatch,
-} from "./schema.js";
+} from "../../../protocol/schema.js";
 import { migrationSql } from "./tables.js";
+
+export type Id = number;
+
+const IdSchema = z.number().int().positive();
 
 export type View = { sessionId: string; revision: number; rootNodeId: Id };
 export type NodeRecord = {
@@ -71,15 +72,23 @@ export type Proposal = {
   decidedAt: string | null;
 };
 export type NewProposal = Omit<Proposal, "id">;
-export type SessionEvent = {
-  sessionId: string;
-  revision: number | null;
+export type SessionEventDocument = {
   rootNodeId: Id | null;
-  operation: string;
+  action: string;
   cursorLinkPath: Id[];
   idempotencyKey: string | null;
-  payload: JsonValue;
+  details: JsonValue;
+  createdAt: string;
 };
+
+const SessionEventDocumentSchema: z.ZodType<SessionEventDocument> = z.object({
+  rootNodeId: IdSchema.nullable(),
+  action: z.string().min(1),
+  cursorLinkPath: z.array(IdSchema),
+  idempotencyKey: z.string().min(1).nullable(),
+  details: JsonSchema,
+  createdAt: z.string().datetime(),
+}).strict();
 
 const RowSchema = z.record(z.string(), z.unknown());
 type Row = z.infer<typeof RowSchema>;
@@ -113,7 +122,7 @@ export interface RecordRepository {
   listEffectiveLinks(parentNodeId: Id, view: View): EffectiveLink[];
   getSessionRevision(sessionId: string, revision: number): SessionRevision;
   listSessionRevisions(sessionId: string): SessionRevision[];
-  appendEvent(event: SessionEvent): void;
+  appendEvent(sessionId: string, revision: number | null, event: SessionEventDocument): void;
   insertProposal(proposal: NewProposal): Proposal;
   listPendingProposals(sessionId: string): Proposal[];
   getPendingProposal(id: Id, sessionId: string): Proposal;
@@ -125,7 +134,7 @@ export interface RecordRepository {
 export class SqliteRecordRepository implements RecordRepository {
   private readonly db: DatabaseSync;
 
-  constructor(file = dataDir() + "/context-tree-v6.sqlite") {
+  constructor(file: string) {
     mkdirSync(dirname(file), { recursive: true });
     this.db = new DatabaseSync(file);
     for (const statement of migrationSql()) this.db.exec(statement);
@@ -148,7 +157,7 @@ export class SqliteRecordRepository implements RecordRepository {
   }
 
   findSession(id: string): Session | null {
-    const row = this.one("SELECT * FROM sessions_v6 WHERE id=?", id);
+    const row = this.one("SELECT * FROM sessions_v7 WHERE id=?", id);
     return row === null ? null : this.session(row);
   }
 
@@ -160,7 +169,7 @@ export class SqliteRecordRepository implements RecordRepository {
 
   insertSession(session: Session): void {
     this.db.prepare(
-      "INSERT INTO sessions_v6(id,workspace_path,root_node_id,head_revision,cursor_link_path_json,parent_session_id,parent_session_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+      "INSERT INTO sessions_v7(id,workspace_path,root_node_id,head_revision,cursor_link_path_json,parent_session_id,parent_session_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
     ).run(
       session.id,
       session.workspacePath,
@@ -176,26 +185,26 @@ export class SqliteRecordRepository implements RecordRepository {
 
   updateSessionHead(sessionId: string, revision: number, cursorLinkPath: Id[]): void {
     this.db.prepare(
-      "UPDATE sessions_v6 SET head_revision=?,cursor_link_path_json=?,updated_at=? WHERE id=?",
+      "UPDATE sessions_v7 SET head_revision=?,cursor_link_path_json=?,updated_at=? WHERE id=?",
     ).run(revision, JSON.stringify(cursorLinkPath), this.timestamp(), sessionId);
   }
 
   updateSessionCursor(sessionId: string, cursorLinkPath: Id[]): void {
     this.db.prepare(
-      "UPDATE sessions_v6 SET cursor_link_path_json=?,updated_at=? WHERE id=?",
+      "UPDATE sessions_v7 SET cursor_link_path_json=?,updated_at=? WHERE id=?",
     ).run(JSON.stringify(cursorLinkPath), this.timestamp(), sessionId);
   }
 
   listSessions(workspacePath: string | null): Session[] {
     const rows = workspacePath === null
-      ? this.all("SELECT * FROM sessions_v6")
-      : this.all("SELECT * FROM sessions_v6 WHERE workspace_path=?", workspacePath);
+      ? this.all("SELECT * FROM sessions_v7")
+      : this.all("SELECT * FROM sessions_v7 WHERE workspace_path=?", workspacePath);
     return rows.map((row) => this.session(row));
   }
 
   createNode(sessionId: string, revision: number): Id {
     return this.insert(
-      "INSERT INTO nodes_v6(created_session_id,created_revision,created_at) VALUES(?,?,?)",
+      "INSERT INTO nodes_v7(created_session_id,created_revision,created_at) VALUES(?,?,?)",
       sessionId,
       revision,
       this.timestamp(),
@@ -204,7 +213,7 @@ export class SqliteRecordRepository implements RecordRepository {
 
   createLink(childNodeId: Id, sessionId: string, revision: number): Link {
     const id = this.insert(
-      "INSERT INTO links_v6(child_node_id,created_session_id,created_revision,created_at) VALUES(?,?,?,?)",
+      "INSERT INTO links_v7(child_node_id,created_session_id,created_revision,created_at) VALUES(?,?,?,?)",
       childNodeId,
       sessionId,
       revision,
@@ -214,7 +223,7 @@ export class SqliteRecordRepository implements RecordRepository {
   }
 
   getLink(id: Id): Link {
-    const row = this.one("SELECT * FROM links_v6 WHERE id=?", id);
+    const row = this.one("SELECT * FROM links_v7 WHERE id=?", id);
     if (row === null) throw new RepositoryError("not_found", "link not found");
     return {
       id: this.id(row.id),
@@ -227,7 +236,7 @@ export class SqliteRecordRepository implements RecordRepository {
 
   insertNodeRecord(nodeId: Id, sessionId: string, revision: number, attributes: WorkFields): NodeRecord {
     const id = this.insert(
-      "INSERT INTO node_records_v6(node_id,session_id,revision,work_json,created_at) VALUES(?,?,?,?,?)",
+      "INSERT INTO node_records_v7(node_id,session_id,revision,work_json,created_at) VALUES(?,?,?,?,?)",
       nodeId,
       sessionId,
       revision,
@@ -238,14 +247,14 @@ export class SqliteRecordRepository implements RecordRepository {
   }
 
   resolveNodeRecord(nodeId: Id, view: View): NodeRecord {
-    const row = this.resolveHistoryRow("node_records_v6", "node_id", nodeId, view);
+    const row = this.resolveHistoryRow("node_records_v7", "node_id", nodeId, view);
     if (row === null) throw new RepositoryError("not_found", "node did not exist in selected revision");
     return this.nodeRecord(row);
   }
 
   nextNodeRecord(nodeId: Id, sessionId: string, revision: number): NodeRecord | null {
     const row = this.one(
-      "SELECT * FROM node_records_v6 WHERE node_id=? AND session_id=? AND revision>? ORDER BY revision LIMIT 1",
+      "SELECT * FROM node_records_v7 WHERE node_id=? AND session_id=? AND revision>? ORDER BY revision LIMIT 1",
       nodeId,
       sessionId,
       revision,
@@ -255,7 +264,7 @@ export class SqliteRecordRepository implements RecordRepository {
 
   insertLinkRecord(linkId: Id, sessionId: string, revision: number, parentNodeId: Id, name: string): LinkRecord {
     const id = this.insert(
-      "INSERT INTO link_records_v6(link_id,session_id,revision,parent_node_id,name,created_at) VALUES(?,?,?,?,?,?)",
+      "INSERT INTO link_records_v7(link_id,session_id,revision,parent_node_id,name,created_at) VALUES(?,?,?,?,?,?)",
       linkId,
       sessionId,
       revision,
@@ -267,14 +276,14 @@ export class SqliteRecordRepository implements RecordRepository {
   }
 
   resolveLinkRecord(linkId: Id, view: View): LinkRecord {
-    const row = this.resolveHistoryRow("link_records_v6", "link_id", linkId, view);
+    const row = this.resolveHistoryRow("link_records_v7", "link_id", linkId, view);
     if (row === null) throw new RepositoryError("not_found", "link did not exist in selected revision");
     return this.linkRecord(row);
   }
 
   nextLinkRecord(linkId: Id, sessionId: string, revision: number): LinkRecord | null {
     const row = this.one(
-      "SELECT * FROM link_records_v6 WHERE link_id=? AND session_id=? AND revision>? ORDER BY revision LIMIT 1",
+      "SELECT * FROM link_records_v7 WHERE link_id=? AND session_id=? AND revision>? ORDER BY revision LIMIT 1",
       linkId,
       sessionId,
       revision,
@@ -287,12 +296,12 @@ export class SqliteRecordRepository implements RecordRepository {
       "WITH RECURSIVE lineage(session_id,max_revision,depth) AS (" +
       "SELECT ?,?,0 UNION ALL " +
       "SELECT s.parent_session_id,s.parent_session_revision,lineage.depth+1 " +
-      "FROM sessions_v6 s JOIN lineage ON s.id=lineage.session_id " +
+      "FROM sessions_v7 s JOIN lineage ON s.id=lineage.session_id " +
       "WHERE s.parent_session_id IS NOT NULL" +
       "), ranked AS (" +
       "SELECT r.*,l.depth,ROW_NUMBER() OVER(PARTITION BY r.link_id ORDER BY l.depth,r.revision DESC) AS rank " +
-      "FROM lineage l JOIN link_records_v6 r ON r.session_id=l.session_id AND r.revision<=l.max_revision" +
-      ") SELECT ranked.*,links_v6.child_node_id FROM ranked JOIN links_v6 ON links_v6.id=ranked.link_id " +
+      "FROM lineage l JOIN link_records_v7 r ON r.session_id=l.session_id AND r.revision<=l.max_revision" +
+      ") SELECT ranked.*,links_v7.child_node_id FROM ranked JOIN links_v7 ON links_v7.id=ranked.link_id " +
       "WHERE ranked.rank=1 AND ranked.parent_node_id=? ORDER BY ranked.name,ranked.link_id",
       view.sessionId,
       view.revision,
@@ -303,7 +312,7 @@ export class SqliteRecordRepository implements RecordRepository {
 
   getSessionRevision(sessionId: string, revision: number): SessionRevision {
     const row = this.one(
-      "SELECT session_id,revision,root_node_id,created_at FROM session_events_v6 WHERE session_id=? AND revision=?",
+      "SELECT session_id,revision,event_json FROM session_events_v7 WHERE session_id=? AND revision=?",
       sessionId,
       revision,
     );
@@ -313,29 +322,25 @@ export class SqliteRecordRepository implements RecordRepository {
 
   listSessionRevisions(sessionId: string): SessionRevision[] {
     return this.all(
-      "SELECT session_id,revision,root_node_id,created_at FROM session_events_v6 WHERE session_id=? AND revision IS NOT NULL ORDER BY revision",
+      "SELECT session_id,revision,event_json FROM session_events_v7 WHERE session_id=? AND revision IS NOT NULL ORDER BY revision",
       sessionId,
     ).map((row) => this.sessionRevision(row));
   }
 
-  appendEvent(event: SessionEvent): void {
+  appendEvent(sessionId: string, revision: number | null, event: SessionEventDocument): void {
+    const document = SessionEventDocumentSchema.parse(event);
     this.db.prepare(
-      "INSERT INTO session_events_v6(session_id,revision,root_node_id,operation,cursor_link_path_json,idempotency_key,payload_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
+      "INSERT INTO session_events_v7(session_id,revision,event_json) VALUES(?,?,?)",
     ).run(
-      event.sessionId,
-      event.revision,
-      event.rootNodeId,
-      event.operation,
-      JSON.stringify(event.cursorLinkPath),
-      event.idempotencyKey,
-      JSON.stringify(JsonSchema.parse(event.payload)),
-      this.timestamp(),
+      sessionId,
+      revision,
+      JSON.stringify(document),
     );
   }
 
   insertProposal(proposal: NewProposal): Proposal {
     const id = this.insert(
-      "INSERT INTO proposals_v6(session_id,source_session_id,source_revision,target_node_id,base_record_id,patch_json,kind,status,created_at,decided_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+      "INSERT INTO proposals_v7(session_id,source_session_id,source_revision,target_node_id,base_record_id,patch_json,kind,status,created_at,decided_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
       proposal.sessionId,
       proposal.sourceSessionId,
       proposal.sourceRevision,
@@ -351,36 +356,36 @@ export class SqliteRecordRepository implements RecordRepository {
   }
 
   listPendingProposals(sessionId: string): Proposal[] {
-    return this.all("SELECT * FROM proposals_v6 WHERE session_id=? AND status='pending' ORDER BY created_at", sessionId)
+    return this.all("SELECT * FROM proposals_v7 WHERE session_id=? AND status='pending' ORDER BY created_at", sessionId)
       .map((row) => this.proposal(row));
   }
 
   getPendingProposal(id: Id, sessionId: string): Proposal {
-    const row = this.one("SELECT * FROM proposals_v6 WHERE id=? AND session_id=? AND status='pending'", id, sessionId);
+    const row = this.one("SELECT * FROM proposals_v7 WHERE id=? AND session_id=? AND status='pending'", id, sessionId);
     if (row === null) throw new RepositoryError("not_found", "pending proposal not found");
     return this.proposal(row);
   }
 
   updateProposalStatus(id: Id, status: ProposalStatus): void {
-    this.db.prepare("UPDATE proposals_v6 SET status=?,decided_at=? WHERE id=?").run(status, this.timestamp(), id);
+    this.db.prepare("UPDATE proposals_v7 SET status=?,decided_at=? WHERE id=?").run(status, this.timestamp(), id);
   }
 
   findReceipt(sessionId: string, key: string): JsonValue | null {
-    const row = this.one("SELECT result_json FROM receipts_v6 WHERE session_id=? AND idempotency_key=?", sessionId, key);
+    const row = this.one("SELECT result_json FROM receipts_v7 WHERE session_id=? AND idempotency_key=?", sessionId, key);
     return row === null ? null : JsonSchema.parse(JSON.parse(String(row.result_json)));
   }
 
   saveReceipt(sessionId: string, key: string, result: unknown): void {
-    this.db.prepare("INSERT INTO receipts_v6(session_id,idempotency_key,result_json,created_at) VALUES(?,?,?,?)")
+    this.db.prepare("INSERT INTO receipts_v7(session_id,idempotency_key,result_json,created_at) VALUES(?,?,?,?)")
       .run(sessionId, key, JSON.stringify(JsonSchema.parse(result)), this.timestamp());
   }
 
-  private resolveHistoryRow(table: "node_records_v6" | "link_records_v6", idColumn: "node_id" | "link_id", id: Id, view: View): Row | null {
+  private resolveHistoryRow(table: "node_records_v7" | "link_records_v7", idColumn: "node_id" | "link_id", id: Id, view: View): Row | null {
     return this.one(
       "WITH RECURSIVE lineage(session_id,max_revision,depth) AS (" +
       "SELECT ?,?,0 UNION ALL " +
       "SELECT s.parent_session_id,s.parent_session_revision,lineage.depth+1 " +
-      "FROM sessions_v6 s JOIN lineage ON s.id=lineage.session_id " +
+      "FROM sessions_v7 s JOIN lineage ON s.id=lineage.session_id " +
       "WHERE s.parent_session_id IS NOT NULL" +
       ") SELECT r.* FROM lineage l JOIN " + table + " r ON r.session_id=l.session_id " +
       "AND r.revision<=l.max_revision WHERE r." + idColumn + "=? ORDER BY l.depth,r.revision DESC LIMIT 1",
@@ -391,19 +396,19 @@ export class SqliteRecordRepository implements RecordRepository {
   }
 
   getNodeRecord(id: Id): NodeRecord {
-    const row = this.one("SELECT * FROM node_records_v6 WHERE id=?", id);
+    const row = this.one("SELECT * FROM node_records_v7 WHERE id=?", id);
     if (row === null) throw new RepositoryError("not_found", "node record not found");
     return this.nodeRecord(row);
   }
 
   private getProposal(id: Id): Proposal {
-    const row = this.one("SELECT * FROM proposals_v6 WHERE id=?", id);
+    const row = this.one("SELECT * FROM proposals_v7 WHERE id=?", id);
     if (row === null) throw new RepositoryError("not_found", "proposal not found");
     return this.proposal(row);
   }
 
   private getLinkRecord(id: Id): LinkRecord {
-    const row = this.one("SELECT * FROM link_records_v6 WHERE id=?", id);
+    const row = this.one("SELECT * FROM link_records_v7 WHERE id=?", id);
     if (row === null) throw new RepositoryError("not_found", "link record not found");
     return this.linkRecord(row);
   }
@@ -446,11 +451,17 @@ export class SqliteRecordRepository implements RecordRepository {
   }
 
   private sessionRevision(row: Row): SessionRevision {
+    const event = this.json(SessionEventDocumentSchema, row.event_json);
+
+    if (event.rootNodeId === null) {
+      throw new RepositoryError("invariant", "revision event is missing its root node");
+    }
+
     return {
       sessionId: String(row.session_id),
       revision: Number(row.revision),
-      rootNodeId: this.id(row.root_node_id),
-      createdAt: String(row.created_at),
+      rootNodeId: event.rootNodeId,
+      createdAt: event.createdAt,
     };
   }
 

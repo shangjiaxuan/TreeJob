@@ -1,17 +1,26 @@
 {
   "name": "context-tree",
-  "version": "0.7.0",
+  "version": "0.8.0+codex.20260914171345",
   "description": "Persistent filesystem-style continuation state for Codex sessions.",
-  "author": { "name": "TreeContext" },
+  "author": {
+    "name": "TreeContext"
+  },
   "mcpServers": "./.mcp.json",
   "skills": "./skills/",
   "interface": {
     "displayName": "Context Tree",
     "shortDescription": "Filesystem-style persistent execution context.",
-    "longDescription": "Stores cursor-relative work nodes, persistent revisions, detours, and compact proposals in a local daemon.",
+    "longDescription": "Stores cursor-relative work nodes, persistent revisions, detours, and compact proposals in a local MCP daemon.",
     "developerName": "TreeContext",
     "category": "Productivity",
-    "capabilities": ["Interactive", "Write"],
-    "defaultPrompt": ["Show my current continuation path and work.", "Create a child node for this detour.", "Resolve my pending compact proposal."]
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Show my current continuation path and work.",
+      "Create a child node for this detour.",
+      "Resolve my pending compact proposal."
+    ]
   }
 }

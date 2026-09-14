@@ -1,13 +1,10 @@
 import { z } from "zod";
-import { parseCommand } from "./commands.js";
-import { ContinuationModel, type ResolvedNode, type ResolvedSession, type StateMutation } from "./continuation-model.js";
-import { RepositoryError, SqliteRecordRepository, type Proposal, type RecordRepository, type SessionRevision, type View } from "./record-repository.js";
-import { writeDiagnostic } from "./diagnostics.js";
+import { parseCommand } from "./command-registry.js";
+import { ContinuationModel, type ResolvedNode, type ResolvedSession } from "../domain/continuation-model.js";
+import { RepositoryError, type Id, type Proposal, type RecordRepository, type SessionEventDocument, type SessionRevision, type View } from "../persistence/record-repository.js";
+import { writeDiagnostic } from "../../runtime/diagnostics.js";
 import {
   CommandInputSchema,
-  OperationSchemas,
-  PROTOCOL_VERSION,
-  schemaDigest,
   type BriefingResult,
   type CdResult,
   type CloseResult,
@@ -15,23 +12,22 @@ import {
   type CursorState,
   type EditResult,
   type EntrySummary,
-  type Id,
   type MkdirResult,
   type MoveResult,
   type ProposalSummary,
   type PwdState,
   type RevisionSummary,
-  type RpcResponse,
   type SearchMatch,
   type WorkPatch,
   WorkFieldsSchema,
-} from "./schema.js";
+} from "../../../protocol/schema.js";
+import { OperationSchemas } from "./operation-schemas.js";
 
 /** Transactional controller for the public filesystem use cases. */
 export class ContinuationController {
   private readonly model: ContinuationModel;
 
-  constructor(private readonly records: RecordRepository = new SqliteRecordRepository()) {
+  constructor(private readonly records: RecordRepository) {
     this.model = new ContinuationModel(records);
   }
 
@@ -62,21 +58,8 @@ export class ContinuationController {
     }
   }
 
-  failure(id: string, error: unknown): RpcResponse {
-    const message = error instanceof Error ? error.message : String(error);
-    const code = error instanceof RepositoryError
-      ? error.code
-      : error instanceof z.ZodError
-        ? "validation"
-        : message.includes("schema digest")
-          ? "unsupported_protocol"
-          : "internal";
-    return { protocolVersion: PROTOCOL_VERSION, id, ok: false, error: { code, message } };
-  }
-
   private dispatchValidated(name: keyof typeof OperationSchemas, raw: unknown, key: string | null): unknown {
     switch (name) {
-      case "hello": return this.hello(raw);
       case "pwd": return this.pwd(raw, key);
       case "ls": return this.ls(raw);
       case "cd": return this.cd(raw, key);
@@ -95,12 +78,6 @@ export class ContinuationController {
     }
   }
 
-  private hello(raw: unknown) {
-    const input = OperationSchemas.hello.input.parse(raw);
-    if (input.schemaDigest !== schemaDigest) throw new Error("schema digest mismatch");
-    return { protocolVersion: PROTOCOL_VERSION, schemaDigest, daemon: "context-tree-v6" };
-  }
-
   private pwd(raw: unknown, key: string | null): PwdState {
     const input = OperationSchemas.pwd.input.parse(raw);
     const existing = this.records.findSession(input.sessionId);
@@ -109,7 +86,9 @@ export class ContinuationController {
       if (existing) {
         return this.pwdState(this.model.resolveSession(input.sessionId));
       }
-      return this.pwdState(this.model.createSession(input.sessionId, input.cwd ?? process.cwd()));
+      const created = this.model.createSession(input.sessionId, input.cwd ?? process.cwd());
+      this.appendEvent(input.sessionId, 0, "session-created", created.rootNodeId, created.cursorLinkPath, key, {});
+      return this.pwdState(this.model.resolveSession(input.sessionId));
     });
   }
 
@@ -250,17 +229,23 @@ export class ContinuationController {
     const input = OperationSchemas.fork.input.parse(raw);
     return this.command(input.sessionId, key, OperationSchemas.fork.output, () => {
       const before = this.model.resolveSession(input.sessionId);
+      const existing = this.records.findSession(input.newSessionId);
       const forked = this.model.fork(before, input.newSessionId);
-      this.records.appendEvent({
-        sessionId: input.sessionId,
-        revision: null,
-        rootNodeId: null,
-        operation: "fork",
-        cursorLinkPath: before.session.cursorLinkPath,
-        idempotencyKey: key,
-        payload: { forkedSessionId: input.newSessionId },
+      if (existing === null) {
+        this.appendEvent(
+          input.newSessionId,
+          0,
+          "fork-created",
+          forked.rootNodeId,
+          forked.cursorLinkPath,
+          key,
+          { parentSessionId: before.session.id, parentRevision: before.view.revision },
+        );
+      }
+      this.appendEvent(input.sessionId, null, "fork", null, before.session.cursorLinkPath, key, {
+        forkedSessionId: input.newSessionId,
       });
-      return { ...this.cursorState(before), forkedSessionId: forked.session.id };
+      return { ...this.cursorState(before), forkedSessionId: input.newSessionId };
     });
   }
 
@@ -328,14 +313,8 @@ export class ContinuationController {
     return this.command(input.sessionId, key, OperationSchemas["submit-proposal"].output, () => {
       const resolved = this.model.resolveSession(input.sessionId);
       const proposal = this.model.createProposal(resolved, input.kind, input.patch ?? null, input.sourceSessionId ?? null);
-      this.records.appendEvent({
-        sessionId: input.sessionId,
-        revision: null,
-        rootNodeId: null,
-        operation: "submit-proposal",
-        cursorLinkPath: resolved.session.cursorLinkPath,
-        idempotencyKey: key,
-        payload: { proposalId: proposal.id },
+      this.appendEvent(input.sessionId, null, "submit-proposal", null, resolved.session.cursorLinkPath, key, {
+        proposalId: proposal.id,
       });
       return this.proposal(proposal);
     });
@@ -353,6 +332,25 @@ export class ContinuationController {
     });
   }
 
+  private appendEvent(
+    sessionId: string,
+    revision: number | null,
+    action: string,
+    rootNodeId: Id | null,
+    cursorLinkPath: Id[],
+    idempotencyKey: string | null,
+    details: SessionEventDocument["details"],
+  ): void {
+    this.records.appendEvent(sessionId, revision, {
+      action,
+      rootNodeId,
+      cursorLinkPath,
+      idempotencyKey,
+      details,
+      createdAt: new Date().toISOString(),
+    });
+  }
+
   private persistMutation(
     resolved: ResolvedSession,
     operation: string,
@@ -361,15 +359,7 @@ export class ContinuationController {
   ): ResolvedSession {
     const revision = resolved.session.headRevision + 1;
     this.records.updateSessionHead(resolved.session.id, revision, cursorLinkPath);
-    this.records.appendEvent({
-      sessionId: resolved.session.id,
-      revision,
-      rootNodeId: resolved.view.rootNodeId,
-      operation,
-      cursorLinkPath,
-      idempotencyKey: key,
-      payload: {},
-    });
+    this.appendEvent(resolved.session.id, revision, operation, resolved.view.rootNodeId, cursorLinkPath, key, {});
     return this.model.resolveSession(resolved.session.id);
   }
 
@@ -380,15 +370,7 @@ export class ContinuationController {
     cursorLinkPath: Id[],
   ): ResolvedSession {
     this.records.updateSessionCursor(resolved.session.id, cursorLinkPath);
-    this.records.appendEvent({
-      sessionId: resolved.session.id,
-      revision: null,
-      rootNodeId: null,
-      operation,
-      cursorLinkPath,
-      idempotencyKey: key,
-      payload: {},
-    });
+    this.appendEvent(resolved.session.id, null, operation, null, cursorLinkPath, key, {});
     return this.model.resolveSession(resolved.session.id);
   }
 
@@ -584,24 +566,3 @@ type DiagnosticState = {
   cursorDepth: number | null;
   currentRecordId: Id | null;
 };
-
-/** Transport-facing adapter boundary; it exposes no model or persistence API. */
-export class FilesystemOperations {
-  constructor(private readonly controller = new ContinuationController()) {}
-
-  hello(raw: unknown): unknown {
-    return this.controller.dispatch("hello", raw);
-  }
-
-  execute(raw: unknown, idempotencyKey?: string): unknown {
-    return this.controller.execute(raw, idempotencyKey);
-  }
-
-  dispose(): void {
-    this.controller.dispose();
-  }
-
-  failure(id: string, error: unknown): RpcResponse {
-    return this.controller.failure(id, error);
-  }
-}

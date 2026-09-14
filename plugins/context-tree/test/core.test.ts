@@ -1,16 +1,24 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { ContinuationController } from "../src/daemon-service.js";
-import { SqliteRecordRepository } from "../src/record-repository.js";
+import { setTimeout as delay } from "node:timers/promises";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { ContinuationController } from "../src/daemon/service/application/daemon-service.js";
+import { SqliteRecordRepository } from "../src/daemon/service/persistence/record-repository.js";
+import { DaemonLaunchGate, DaemonRegistryOwner } from "../src/daemon/runtime/registry.js";
+import { configuredEndpoint } from "../src/clients/transport.js";
 
 type Context = {
   controller: ContinuationController;
+  directory: string;
   cleanup(): void;
 };
 
@@ -19,6 +27,7 @@ function createContext(): Context {
   const repository = new SqliteRecordRepository(join(directory, "context-tree.sqlite"));
   return {
     controller: new ContinuationController(repository),
+    directory,
     cleanup() {
       repository.close();
       rmSync(directory, { recursive: true, force: true });
@@ -52,6 +61,80 @@ test("pwd is detailed while mutations return compact affected-state acknowledgem
     assert.deepEqual(edit.updated, { path: "/detour", fields: ["currentState"] });
   } finally {
     context.cleanup();
+  }
+});
+
+test("session events use one validated JSON document with indexed revisions", () => {
+  const context = createContext();
+  let database: DatabaseSync | undefined;
+
+  try {
+    command(context.controller, "session", ["pwd", "C:/work"]);
+    command(context.controller, "session", ["edit", { currentState: "recorded" }]);
+    database = new DatabaseSync(join(context.directory, "context-tree.sqlite"));
+    const columns = database.prepare("PRAGMA table_info(session_events_v7)").all() as Array<{ name: string }>;
+    const event = database.prepare(
+      "SELECT revision,event_json FROM session_events_v7 WHERE session_id=? AND revision=?",
+    ).get("session", 1) as { revision: number; event_json: string } | undefined;
+    assert.deepEqual(columns.map((column) => column.name), ["sequence", "session_id", "revision", "event_json"]);
+    assert.equal(event?.revision, 1);
+    assert.equal(JSON.parse(event?.event_json ?? "{}").action, "edit");
+  } finally {
+    database?.close();
+    context.cleanup();
+  }
+});
+
+test("clients require an explicit endpoint for a dynamic daemon port", () => {
+  const previousPort = process.env.CONTEXT_TREE_MCP_PORT;
+  const previousEndpoint = process.env.CONTEXT_TREE_MCP_ENDPOINT;
+
+  try {
+    process.env.CONTEXT_TREE_MCP_PORT = "0";
+    delete process.env.CONTEXT_TREE_MCP_ENDPOINT;
+    assert.throws(() => configuredEndpoint(), /ENDPOINT is required/);
+
+    process.env.CONTEXT_TREE_MCP_ENDPOINT = "http://127.0.0.1:45123/mcp";
+    assert.equal(configuredEndpoint().toString(), "http://127.0.0.1:45123/mcp");
+
+    process.env.CONTEXT_TREE_MCP_ENDPOINT = "http://example.test/mcp";
+    assert.throws(() => configuredEndpoint(), /loopback/);
+  } finally {
+    restoreEnvironment("CONTEXT_TREE_MCP_PORT", previousPort);
+    restoreEnvironment("CONTEXT_TREE_MCP_ENDPOINT", previousEndpoint);
+  }
+});
+
+test("daemon ownership and startup are exclusive across data directories", () => {
+  const directory = mkdtempSync(join(tmpdir(), "context-tree-registry-test-"));
+  const runtime = join(directory, "runtime");
+  const first = new DaemonRegistryOwner(join(directory, "first-data"), runtime);
+  const second = new DaemonRegistryOwner(join(directory, "second-data"), runtime);
+  const firstLaunch = new DaemonLaunchGate(runtime);
+  const secondLaunch = new DaemonLaunchGate(runtime);
+
+  try {
+    assert.equal(first.acquire(), true);
+    assert.equal(second.acquire(), false);
+    first.close();
+    writeFileSync(join(runtime, "daemon-v7.json"), JSON.stringify({
+      endpoint: "http://127.0.0.1:45124/mcp",
+      pid: 999_999,
+      dataDirectoryFingerprint: "stale",
+      serviceVersion: "0.0.0",
+      startedAt: new Date().toISOString(),
+    }));
+    assert.equal(second.acquire(), true);
+    assert.equal(firstLaunch.acquire(), true);
+    assert.equal(secondLaunch.acquire(), false);
+    firstLaunch.close();
+    assert.equal(secondLaunch.acquire(), true);
+  } finally {
+    first.close();
+    second.close();
+    firstLaunch.close();
+    secondLaunch.close();
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -178,6 +261,56 @@ test("forks retain a frozen view after the parent changes", () => {
   }
 });
 
+test("the daemon MCP endpoint and STDIO bridge expose the same command tool", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "context-tree-mcp-test-"));
+  const port = 44_500 + (process.pid % 1_000);
+  const daemon = fileURLToPath(new URL("../daemon.mjs", import.meta.url));
+  const bridge = fileURLToPath(new URL("../mcp.mjs", import.meta.url));
+  const environment = {
+    ...process.env,
+    CONTEXT_TREE_DATA_DIR: directory,
+    CONTEXT_TREE_TEST_RUNTIME_DIR: join(directory, "runtime"),
+    CONTEXT_TREE_MCP_PORT: String(port),
+    CONTEXT_TREE_EPHEMERAL: "1",
+  };
+  const child = spawn(process.execPath, [daemon], { env: environment, stdio: "ignore" });
+  let direct: Client | undefined;
+  let proxy: Client | undefined;
+
+  try {
+    direct = await connectHttpClient(port);
+    const directTools = await direct.listTools();
+    assert.deepEqual(directTools.tools.map((tool) => tool.name), ["command"]);
+    const directResult = await direct.callTool({
+      name: "command",
+      arguments: { sessionId: "direct", command: ["pwd", "C:/work"] },
+    });
+    assert.equal(directResult.isError, undefined);
+
+    proxy = new Client({ name: "proxy-test", version: "1" });
+    await proxy.connect(new StdioClientTransport({
+      command: process.execPath,
+      args: [bridge],
+      env: environment,
+      cwd: process.cwd(),
+      stderr: "pipe",
+    }));
+    const proxyTools = await proxy.listTools();
+    assert.deepEqual(proxyTools.tools.map((tool) => tool.name), ["command"]);
+    const proxyResult = await proxy.callTool({
+      name: "command",
+      arguments: { sessionId: "proxy", command: ["pwd", "C:/work"] },
+    });
+    assert.equal(proxyResult.isError, undefined);
+  } finally {
+    await direct?.close();
+    await proxy?.close();
+    child.kill("SIGTERM");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("PreCompact records a bounded transcript checkpoint when its worker is unavailable", async () => {
   const directory = mkdtempSync(join(tmpdir(), "context-tree-hook-test-"));
   const transcript = join(directory, "transcript.jsonl");
@@ -195,6 +328,7 @@ test("PreCompact records a bounded transcript checkpoint when its worker is unav
       env: {
         ...process.env,
         CONTEXT_TREE_DATA_DIR: directory,
+        CONTEXT_TREE_TEST_RUNTIME_DIR: join(directory, "runtime"),
         CONTEXT_TREE_CODEX_BIN: "context-tree-missing-worker",
         CONTEXT_TREE_EPHEMERAL: "1",
       },
@@ -215,3 +349,30 @@ test("PreCompact records a bounded transcript checkpoint when its worker is unav
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+async function connectHttpClient(port: number): Promise<Client> {
+  const endpoint = new URL("http://127.0.0.1:" + port + "/mcp");
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const client = new Client({ name: "direct-test", version: "1" });
+
+    try {
+      await client.connect(new StreamableHTTPClientTransport(endpoint), { timeout: 250 });
+      return client;
+    } catch (error) {
+      lastError = error;
+      await delay(50);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("daemon MCP endpoint did not start");
+}
+
+function restoreEnvironment(name: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
+}

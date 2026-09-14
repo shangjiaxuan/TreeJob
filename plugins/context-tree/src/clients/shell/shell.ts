@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
-import { callCommand } from "./rpc.js";
+import { callCommand } from "../command-client.js";
 import { tokenize } from "./shell-lexer.js";
 
 type ShellOptions = {

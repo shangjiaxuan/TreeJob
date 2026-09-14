@@ -2,7 +2,6 @@ import { z } from "zod";
 import type {
   ContractMetadata,
   ContractSpec,
-  OperationMetadata,
 } from "./contract-metadata.js";
 
 export class ContractMetadataError extends Error {}
@@ -32,16 +31,6 @@ export class ContractRuntime {
     this.namedSchemas.set(name, schema);
 
     return schema;
-  }
-
-  operation(name: string): OperationMetadata {
-    const operation = this.metadata.operations[name];
-
-    if (!operation) {
-      throw new ContractMetadataError("unknown operation: " + name);
-    }
-
-    return operation;
   }
 
   compile(specification: ContractSpec): z.ZodType {

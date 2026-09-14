@@ -1,6 +1,6 @@
 # Context Tree
 
-Context Tree is a local persistent continuation notebook for Codex. Its v6
+Context Tree is a local persistent continuation notebook for Codex. Its v7
 storage model separates logical node work from directory topology: nodes are
 inode-like continuation identities, while stable links own historical names and
 placements. Public history is a per-session timeline (`r0`, `r1`, ...), where
@@ -12,9 +12,22 @@ Node 22+ runtime and does not retain development dependencies.
 
 ## Development shell
 
-The shell is a development-only integration harness. It talks to the daemon
-through the same RPC client as the MCP server and hooks; it never opens the
+The shell is a development-only integration harness. It, lifecycle hooks, the
+browser, and Codex's STDIO bridge are independent MCP clients; none opens the
 continuation database itself.
+
+The daemon owns the local Streamable HTTP MCP endpoint at
+`http://127.0.0.1:43177/mcp` by default. Set `CONTEXT_TREE_MCP_PORT` to use a
+different fixed port. `CONTEXT_TREE_MCP_PORT=0` is for manually managed runs;
+clients then require an explicit loopback `CONTEXT_TREE_MCP_ENDPOINT` ending in
+`/mcp`.
+
+There is one normal daemon per OS user, not one per client or data directory.
+Concurrent clients invoke the same daemon executable; its single startup-gate
+winner claims the user-local owner lease before it opens SQLite. Other starts
+exit without initializing daemon state. A data-directory override selects that
+daemon's database only when it is first started; it does not create an
+independent daemon.
 
 Install development dependencies and start a disposable notebook. Disposable is
 the default, so the short command is enough:
@@ -98,7 +111,7 @@ for an existing Context Tree session ID, stores it in a local `HttpOnly`,
 with `http://127.0.0.1:<port>/browse/<path>`; add `?revision=<id>` to inspect a
 historical session revision. Add `?reference=<id>` when the URL path should be
 resolved against a historical state rather than the session head. The page is
-read-only and queries the daemon instead of opening SQLite.
+read-only and queries the daemon through MCP instead of opening SQLite.
 
 ## Staged marketplace artifact
 

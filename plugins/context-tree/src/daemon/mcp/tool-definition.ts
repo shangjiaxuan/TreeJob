@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { publicCommandHelp } from "./commands.js";
-import { CommandInputSchema } from "./schema.js";
+import { publicCommandHelp } from "../service/application/command-registry.js";
+import { CommandInputSchema } from "../../protocol/schema.js";
 
 export const mcpTools = [{
   name: "command",

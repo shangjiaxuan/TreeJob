@@ -18,7 +18,7 @@ await cp(pluginRoot, stagedPlugin, {
     return ![
       "node_modules",
       "dist",
-      "src/generated",
+      "src/protocol/generated",
     ].some((ignored) => path === ignored || path.startsWith(ignored + "/"));
   },
 });

@@ -2,6 +2,7 @@ import { resolve as resolveFilesystemPath } from "node:path";
 import {
   RepositoryError,
   type EffectiveLink,
+  type Id,
   type Link,
   type NodeRecord,
   type Proposal,
@@ -9,14 +10,13 @@ import {
   type Session,
   type SessionRevision,
   type View,
-} from "./record-repository.js";
+} from "../persistence/record-repository.js";
 import {
   WorkFieldsSchema,
-  type Id,
   type ProposalDecision,
   type WorkFields,
   type WorkPatch,
-} from "./schema.js";
+} from "../../../protocol/schema.js";
 
 const terminal = new Set(["done", "abandoned", "superseded"]);
 
@@ -39,6 +39,11 @@ export type StateMutation = {
   cursorLinkPath: Id[];
 };
 
+export type InitializedSession = {
+  rootNodeId: Id;
+  cursorLinkPath: Id[];
+};
+
 export type ProposalMutation =
   | { kind: "unchanged"; cursorLinkPath: Id[]; status: "rejected" | "discarded" }
   | { kind: "state"; cursorLinkPath: Id[]; status: "applied" };
@@ -47,13 +52,13 @@ type PathSegment = { value: string; escaped: boolean };
 type LinkLocation = { parentNodeId: Id; name: string };
 
 /**
- * v6 evaluates work and topology independently in an explicit session view.
+ * v7 evaluates work and topology independently in an explicit session view.
  * Node records hold work; link records hold names and placement.
  */
 export class ContinuationModel {
   constructor(private readonly records: RecordRepository) {}
 
-  createSession(sessionId: string, cwd: string): ResolvedSession {
+  createSession(sessionId: string, cwd: string): InitializedSession {
     const createdAt = this.timestamp();
     const rootNodeId = this.records.createNode(sessionId, 0);
     this.records.insertNodeRecord(rootNodeId, sessionId, 0, this.emptyWork());
@@ -68,16 +73,7 @@ export class ContinuationModel {
       createdAt,
       updatedAt: createdAt,
     });
-    this.records.appendEvent({
-      sessionId,
-      revision: 0,
-      rootNodeId,
-      operation: "pwd",
-      cursorLinkPath: [],
-      idempotencyKey: null,
-      payload: {},
-    });
-    return this.resolveSession(sessionId);
+    return { rootNodeId, cursorLinkPath: [] };
   }
 
   validateWorkspace(session: Session, cwd: string): void {
@@ -197,9 +193,11 @@ export class ContinuationModel {
     };
   }
 
-  fork(resolved: ResolvedSession, newSessionId: string): ResolvedSession {
+  fork(resolved: ResolvedSession, newSessionId: string): InitializedSession {
     const existing = this.records.findSession(newSessionId);
-    if (existing !== null) return this.resolveSession(newSessionId);
+    if (existing !== null) {
+      return { rootNodeId: existing.rootNodeId, cursorLinkPath: existing.cursorLinkPath };
+    }
     const createdAt = this.timestamp();
     this.records.insertSession({
       id: newSessionId,
@@ -212,16 +210,10 @@ export class ContinuationModel {
       createdAt,
       updatedAt: createdAt,
     });
-    this.records.appendEvent({
-      sessionId: newSessionId,
-      revision: 0,
+    return {
       rootNodeId: resolved.view.rootNodeId,
-      operation: "fork",
       cursorLinkPath: resolved.session.cursorLinkPath,
-      idempotencyKey: null,
-      payload: { parentSessionId: resolved.session.id, parentRevision: resolved.view.revision },
-    });
-    return this.resolveSession(newSessionId);
+    };
   }
 
   createProposal(

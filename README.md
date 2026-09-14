@@ -1,6 +1,6 @@
 # Context Tree
 
-Context Tree is a Codex plugin PoC for persistent, tree-shaped continuation state. The local daemon owns the continuation SQLite database; the STDIO MCP server and Codex lifecycle hooks communicate with it over a user-local socket.
+Context Tree is a Codex plugin PoC for persistent, tree-shaped continuation state. The local daemon owns the continuation SQLite database and the Streamable HTTP MCP endpoint; the STDIO bridge and lifecycle hooks are MCP clients.
 
 ## Layout
 
@@ -8,7 +8,7 @@ Context Tree is a Codex plugin PoC for persistent, tree-shaped continuation stat
 - `plugins/context-tree` is the authored plugin source.
 - `out/context-tree-marketplace` is the ignored, generated installable marketplace artifact.
 
-The default data directory is `%LOCALAPPDATA%\\ContextTree` on Windows, or the directory specified by `CONTEXT_TREE_DATA_DIR`. The daemon database holds continuation records; `journal/hook-journal.sqlite` holds only transcript checkpoints and worker diagnostics.
+The default data directory is `%LOCALAPPDATA%\\ContextTree` on Windows, or the directory specified by `CONTEXT_TREE_DATA_DIR`. The daemon database holds continuation records; `journal/hook-journal.sqlite` holds only transcript checkpoints and worker diagnostics. The MCP endpoint defaults to `http://127.0.0.1:43177/mcp`; set `CONTEXT_TREE_MCP_PORT` to override it.
 
 ## Development
 

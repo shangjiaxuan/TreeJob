@@ -2,8 +2,8 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import ts from "typescript";
 
-const contractFile = join(process.cwd(), "src", "contracts.ts");
-const outputFile = join(process.cwd(), "src", "generated", "contracts-metadata.ts");
+const contractFile = join(process.cwd(), "src", "protocol", "contracts.ts");
+const outputFile = join(process.cwd(), "src", "protocol", "generated", "contracts-metadata.ts");
 
 const program = ts.createProgram([contractFile], {
   target: ts.ScriptTarget.ES2022,
@@ -40,11 +40,9 @@ for (const [name, declaration] of declarations) {
   }
 }
 
-const operations = describeOperations(declarations.get("OperationContracts"));
 const metadata = {
-  version: 3,
+  version: 4,
   schemas,
-  operations,
 };
 
 await mkdir(dirname(outputFile), { recursive: true });
@@ -59,46 +57,6 @@ await writeFile(
     "",
   ].join("\n"),
 );
-
-function describeOperations(declaration) {
-  if (!declaration || !ts.isInterfaceDeclaration(declaration)) {
-    throw new Error("OperationContracts interface is required");
-  }
-
-  const operations = {};
-
-  for (const member of declaration.members) {
-    if (!ts.isPropertySignature(member) || !member.name || !member.type) {
-      continue;
-    }
-
-    if (
-      (!ts.isIdentifier(member.name) && !ts.isStringLiteral(member.name)) ||
-      !ts.isTypeLiteralNode(member.type)
-    ) {
-      throw new Error("operation declarations must use named type literals");
-    }
-
-    const fields = {};
-
-    for (const operationField of member.type.members) {
-      if (
-        !ts.isPropertySignature(operationField) ||
-        !operationField.name ||
-        !operationField.type ||
-        !ts.isIdentifier(operationField.name)
-      ) {
-        continue;
-      }
-
-      fields[operationField.name.text] = describeType(operationField.type);
-    }
-
-    operations[member.name.text] = fields;
-  }
-
-  return operations;
-}
 
 function describeDeclaration(declaration) {
   if (ts.isInterfaceDeclaration(declaration)) {

@@ -6,7 +6,8 @@ import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { renderAncestorBriefing, renderMinimalPath } from "./briefing.js";
-import { callCommand, dataDir } from "./rpc.js";
+import { callCommand } from "../command-client.js";
+import { dataDirectory } from "../../daemon/runtime/config.js";
 import {
   BriefingResultSchema,
   JsonSchema,
@@ -14,7 +15,7 @@ import {
   PwdStateSchema,
   WorkPatchSchema,
   type CommandAtom,
-} from "./schema.js";
+} from "../../protocol/schema.js";
 
 const HookEventSchema = z.object({
   hook_event_name: z.string().optional(),
@@ -178,7 +179,7 @@ function readTranscriptDelta(journal: HookJournal, session: string, transcriptPa
 }
 
 function openHookJournal(): HookJournal {
-  const directory = join(dataDir(), "journal");
+  const directory = join(dataDirectory(), "journal");
   mkdirSync(directory, { recursive: true });
   const output = new DatabaseSync(join(directory, "hook-journal.sqlite"));
   output.exec("CREATE TABLE IF NOT EXISTS transcript_checkpoints_v2(session_id TEXT NOT NULL,transcript_path TEXT NOT NULL,byte_offset INTEGER NOT NULL,prefix_fingerprint TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(session_id,transcript_path))");
