@@ -59,16 +59,27 @@ export async function callCommand(
 ): Promise<unknown> {
   const params = CommandInputSchema.parse(raw);
   const directory = dataDir();
+  const key = idempotencyKey ?? (params.sessionId ? randomUUID() : undefined);
   mkdirSync(directory, { recursive: true });
 
+  await ensureDaemon(directory);
+  try {
+    return JsonSchema.parse(await send("command", params, timeout, key));
+  } catch (error) {
+    if (!isTransportFailure(error)) throw error;
+    await ensureDaemon(directory);
+    return JsonSchema.parse(await send("command", params, timeout, key));
+  }
+}
+
+class RpcCommandError extends Error {}
+
+async function ensureDaemon(directory: string): Promise<void> {
   try {
     await hello();
-    const response = await send("command", params, timeout, idempotencyKey);
-    return JsonSchema.parse(response);
-  } catch {
+  } catch (error) {
+    if (!isTransportFailure(error)) throw error;
     await startDaemon(directory);
-    const response = await send("command", params, timeout, idempotencyKey);
-    return JsonSchema.parse(response);
   }
 }
 
@@ -118,7 +129,7 @@ function send(
         const failure = RpcFailureSchema.safeParse(raw);
 
         if (failure.success) {
-          throw new Error(
+          throw new RpcCommandError(
             failure.data.error.code + ": " + failure.data.error.message,
           );
         }
@@ -130,6 +141,13 @@ function send(
       }
     });
   });
+}
+
+function isTransportFailure(error: unknown): boolean {
+  if (error instanceof RpcCommandError || !(error instanceof Error)) return false;
+  const code = "code" in error ? String(error.code) : "";
+  return ["ECONNREFUSED", "ENOENT", "EPIPE", "ECONNRESET", "ETIMEDOUT"].includes(code)
+    || error.message === "daemon timeout";
 }
 
 async function hello(): Promise<void> {

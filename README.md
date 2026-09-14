@@ -5,8 +5,8 @@ Context Tree is a Codex plugin PoC for persistent, tree-shaped continuation stat
 ## Layout
 
 - `.agents/plugins/marketplace.json` registers the project marketplace entry.
-- `plugins/context-tree` is the installable plugin.
-- `plugins/context-tree/dist` contains the bundled Node 22+ runtime. It does not need `node_modules` after installation.
+- `plugins/context-tree` is the authored plugin source.
+- `out/context-tree-marketplace` is the ignored, generated installable marketplace artifact.
 
 The default data directory is `%LOCALAPPDATA%\\ContextTree` on Windows, or the directory specified by `CONTEXT_TREE_DATA_DIR`. The daemon database holds continuation records; `journal/hook-journal.sqlite` holds only transcript checkpoints and worker diagnostics.
 
@@ -20,7 +20,11 @@ npm test
 npm run validate
 ```
 
-Install the project marketplace in Codex, then install the `context-tree` plugin. The included skill tells agents to inspect the active path, preserve return conditions, close detours explicitly, and decide compact proposals before further mutations. A copyable policy fragment is at `plugins/context-tree/AGENTS.md.snippet`.
+Run `npm run package-artifact` from `plugins/context-tree`, then install the
+staged marketplace at `out/context-tree-marketplace`. The included skill tells
+agents to inspect the active path, preserve return conditions, close detours
+explicitly, and decide compact proposals before further mutations. A copyable
+policy fragment is at `plugins/context-tree/AGENTS.md.snippet`.
 
 ## Current PoC boundary
 

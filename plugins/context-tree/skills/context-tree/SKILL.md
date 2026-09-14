@@ -9,9 +9,8 @@ as `{ sessionId: "session", command: ["mkdir", "investigate", {"returnCondition"
 
 - Call `pwd` and, when needed, `briefing` before broad searches for prior decisions
   or logs.
-- At the first substantial user request, if the root still has the generic
-  initialization text, call `edit` to set its objective, rationale, and return
-  condition.
+- At the first substantial user request, inspect `pwd`. If the root objective,
+  rationale, or return condition is blank, call `edit` to set all three.
 - Create a child only when work gains an independently describable return
   condition; do not create nodes for mechanical commands.
 - Every child needs a path name and return condition. Close it with a summary when
@@ -31,8 +30,10 @@ as `{ sessionId: "session", command: ["mkdir", "investigate", {"returnCondition"
 - Keep material engineering facts in dated logs/ and mature conclusions in
   notes/; record their paths in node references. Context Tree is the
   continuation cursor and pointer layer, not the authority for those facts.
-- After compaction, inspect pending proposals and use `decide-proposal` to
-  explicitly apply, replace, reject, or discard one before further tree mutations.
+- After compaction, inspect the injected compact proposal and use
+  `decide-proposal` to explicitly apply, replace, reject, or discard it before
+  further tree mutations. The decision response describes the affected node,
+  not unrelated current work; use `pwd` when the full active work is needed.
 - Do not mark a root done while any descendant is open or blocked.
 - For read-only inspection outside the agent loop, the optional local browser
   can show one existing session's workspace tree, node work, and revisions.

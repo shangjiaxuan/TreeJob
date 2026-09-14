@@ -111,6 +111,30 @@ export interface EntrySummary {
 }
 
 /** @schema @strict */
+export interface CreatedEntry extends EntrySummary {
+  path: string;
+}
+
+/** @schema @strict */
+export interface UpdatedWork {
+  path: string;
+  fields: string[];
+}
+
+/** @schema @strict */
+export interface MovedNode {
+  from: string;
+  to: string;
+}
+
+/** @schema @strict */
+export interface ClosedNode {
+  path: string;
+  status: "done" | "abandoned" | "superseded";
+  summary: string;
+}
+
+/** @schema @strict */
 export interface RevisionSummary {
   revision: Revision;
   createdAt: Timestamp;
@@ -121,7 +145,9 @@ export interface RevisionSummary {
 export interface SearchMatch {
   path: string;
   name: string;
-  work: CurrentWork;
+  field: string;
+  snippet: string;
+  status: RecordStatus;
   revision?: Revision;
 }
 
@@ -140,14 +166,25 @@ export interface ProposalSummary {
   status: ProposalStatus;
   createdAt: Timestamp;
   sourceSessionId: string | null;
+  targetPath: string;
+  baseWork: CurrentWork;
   patch: WorkPatch | null;
+  afterPreview: CurrentWork | null;
+}
+
+/** @schema @strict */
+export interface ClosedChildOutcome {
+  path: string;
+  title: string;
+  status: "done" | "abandoned" | "superseded";
+  summary: string;
 }
 
 /** @schema @strict */
 export interface BriefingEntry {
   path: string;
   work: CurrentWork;
-  closedChildOutcomes: string[];
+  closedChildOutcomes: ClosedChildOutcome[];
 }
 
 /** @schema @strict */
@@ -181,14 +218,41 @@ export interface RevisionShowResult extends CursorState {
 }
 
 /** @schema @strict */
+export interface CdResult extends CursorState {
+  movedTo: string;
+}
+
+/** @schema @strict */
+export interface MkdirResult extends CursorState {
+  created: CreatedEntry;
+}
+
+/** @schema @strict */
+export interface EditResult extends CursorState {
+  updated: UpdatedWork;
+}
+
+/** @schema @strict */
+export interface MoveResult extends CursorState {
+  moved: MovedNode;
+}
+
+/** @schema @strict */
+export interface CloseResult extends CursorState {
+  closed: ClosedNode;
+}
+
+/** @schema @strict */
 export interface ProposalListResult extends CursorState {
   proposals: ProposalSummary[];
 }
 
 /** @schema @strict */
 export interface ProposalDecisionResult extends CursorState {
-  proposalId: Id;
+  proposal: ProposalSummary;
   status: ProposalStatus;
+  before: CurrentWork;
+  after: CurrentWork | null;
 }
 
 /** @schema @strict */
@@ -317,14 +381,14 @@ export interface CommandHelpResult {
 
 /** @schema @strict */
 export interface HelloInput {
-  protocolVersion: 4;
+  protocolVersion: 5;
   /** @minLength 1 */
   schemaDigest: string;
 }
 
 /** @schema @strict */
 export interface HelloOutput {
-  protocolVersion: 4;
+  protocolVersion: 5;
   schemaDigest: string;
   daemon: string;
 }
@@ -334,11 +398,11 @@ export interface OperationContracts {
   hello: { input: HelloInput; output: HelloOutput; command: false };
   pwd: { input: PwdInput; output: PwdState; command: true };
   ls: { input: ListInput; output: ListResult; command: false };
-  cd: { input: CdInput; output: CursorState; command: true };
-  mkdir: { input: MkdirInput; output: CursorState; command: true };
-  edit: { input: EditInput; output: CursorState; command: true };
-  mv: { input: MoveInput; output: CursorState; command: true };
-  close: { input: CloseInput; output: CursorState; command: true };
+  cd: { input: CdInput; output: CdResult; command: true };
+  mkdir: { input: MkdirInput; output: MkdirResult; command: true };
+  edit: { input: EditInput; output: EditResult; command: true };
+  mv: { input: MoveInput; output: MoveResult; command: true };
+  close: { input: CloseInput; output: CloseResult; command: true };
   search: { input: SearchInput; output: SearchResult; command: false };
   "rev-list": { input: RevisionListInput; output: RevisionListResult; command: false };
   "rev-show": { input: RevisionShowInput; output: RevisionShowResult; command: false };
@@ -367,7 +431,7 @@ export interface RpcError {
 
 /** @schema @strict */
 export interface RpcRequest {
-  protocolVersion: 4;
+  protocolVersion: 5;
   /** @minLength 1 */
   id: string;
   /** @minLength 1 */
@@ -378,7 +442,7 @@ export interface RpcRequest {
 
 /** @schema @strict */
 export interface RpcSuccess {
-  protocolVersion: 4;
+  protocolVersion: 5;
   id: string;
   ok: true;
   result: JsonValue;
@@ -386,7 +450,7 @@ export interface RpcSuccess {
 
 /** @schema @strict */
 export interface RpcFailure {
-  protocolVersion: 4;
+  protocolVersion: 5;
   id: string;
   ok: false;
   error: RpcError;

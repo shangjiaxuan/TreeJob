@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -10,10 +10,12 @@ import { tokenize } from "./shell-lexer.js";
 type ShellOptions = {
   dataDir: string;
   sessionId: string | null;
+  cleanupDataDir: boolean;
 };
 
 const options = parseOptions(process.argv.slice(2));
 process.env.CONTEXT_TREE_DATA_DIR = options.dataDir;
+if (options.cleanupDataDir) process.env.CONTEXT_TREE_EPHEMERAL = "1";
 const defaultSessionId = options.sessionId ?? "shell-" + randomUUID();
 
 const readline = createInterface({
@@ -27,20 +29,23 @@ stdout.write("Database: " + options.dataDir + "\n");
 stdout.write("Default session: " + defaultSessionId + "\n");
 stdout.write("Enter filesystem commands. Type help for the daemon command reference.\n\n");
 
-for await (const line of readline) {
-  try {
-    const shouldContinue = await execute(line);
+try {
+  for await (const line of readline) {
+    try {
+      const shouldContinue = await execute(line);
 
-    if (!shouldContinue) {
-      break;
+      if (!shouldContinue) {
+        break;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      stdout.write("Error: " + message + "\n");
     }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    stdout.write("Error: " + message + "\n");
   }
+} finally {
+  readline.close();
+  if (options.cleanupDataDir) await cleanupTemporaryDataDir(options.dataDir);
 }
-
-readline.close();
 
 async function execute(line: string): Promise<boolean> {
   const command = tokenize(line);
@@ -117,7 +122,18 @@ function parseOptions(args: string[]): ShellOptions {
       join(tmpdir(), "context-tree-shell-"),
     ),
     sessionId: requestedSessionId ?? null,
+    cleanupDataDir: !requestedDataDir,
   };
+}
+
+async function cleanupTemporaryDataDir(directory: string): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  try {
+    rmSync(directory, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    stdout.write("Context Tree could not clean temporary data at " + directory + ": " + message + "\n");
+  }
 }
 
 function printUsageAndExit(): never {

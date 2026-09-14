@@ -48,7 +48,7 @@ const server = net.createServer((socket) => {
     clientCount -= 1;
 
     if (clientCount === 0) {
-      idleTimer = setTimeout(() => server.close(), 60_000);
+      idleTimer = setTimeout(() => server.close(), process.env.CONTEXT_TREE_EPHEMERAL === "1" ? 150 : 60_000);
     }
   });
 });
@@ -58,6 +58,7 @@ server.listen(socketEndpoint, () => {
 });
 
 server.on("close", () => {
+  controller.dispose();
   if (process.platform !== "win32" && existsSync(socketEndpoint)) {
     rmSync(socketEndpoint, { force: true });
   }

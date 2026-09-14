@@ -6,12 +6,18 @@ import type {
   CommandHelpEntry,
   CommandHelpResult,
   CommandInput,
+  CdResult,
+  CloseResult,
+  ClosedChildOutcome,
+  ClosedNode,
   CloseInput,
   CursorState,
   CurrentDirectory,
   CurrentWork,
+  CreatedEntry,
   DecideProposalInput,
   EditInput,
+  EditResult,
   EntrySummary,
   ForkInput,
   ForkResult,
@@ -20,7 +26,10 @@ import type {
   Id,
   JsonValue,
   ListResult,
+  MkdirResult,
   MkdirInput,
+  MoveResult,
+  MovedNode,
   MoveInput,
   RevisionSummary,
   OperationContracts,
@@ -57,11 +66,12 @@ import type {
   Timestamp,
   WorkFields,
   WorkPatch,
+  UpdatedWork,
 } from "./contracts.js";
 import { contractMetadata } from "./generated/contracts-metadata.js";
 import { ContractRuntime } from "./schema-runtime.js";
 
-export const PROTOCOL_VERSION = 4 as const;
+export const PROTOCOL_VERSION = 5 as const;
 
 const runtime = new ContractRuntime(contractMetadata);
 
@@ -87,6 +97,7 @@ export const ListResultSchema = typedSchema<ListResult>("ListResult");
 export const RevisionListResultSchema = typedSchema<RevisionListResult>("RevisionListResult");
 export const RevisionShowResultSchema = typedSchema<RevisionShowResult>("RevisionShowResult");
 export const ProposalSummarySchema = typedSchema<ProposalSummary>("ProposalSummary");
+export const ProposalListResultSchema = typedSchema<ProposalListResult>("ProposalListResult");
 export const ProposalKindSchema = typedSchema<ProposalKind>("ProposalKind");
 export const ProposalStatusSchema = typedSchema<ProposalStatus>("ProposalStatus");
 export const ProposalDecisionSchema = typedSchema<ProposalDecision>("ProposalDecision");
@@ -98,12 +109,18 @@ export type {
   CommandHelpEntry,
   CommandHelpResult,
   CommandInput,
+  CdResult,
+  CloseResult,
+  ClosedChildOutcome,
+  ClosedNode,
   CloseInput,
   CursorState,
   CurrentDirectory,
   CurrentWork,
+  CreatedEntry,
   DecideProposalInput,
   EditInput,
+  EditResult,
   EntrySummary,
   ForkInput,
   ForkResult,
@@ -112,7 +129,10 @@ export type {
   Id,
   JsonValue,
   ListResult,
+  MkdirResult,
   MkdirInput,
+  MoveResult,
+  MovedNode,
   MoveInput,
   RevisionSummary,
   OperationName,
@@ -148,6 +168,7 @@ export type {
   Timestamp,
   WorkFields,
   WorkPatch,
+  UpdatedWork,
 };
 
 export type OperationInput<N extends OperationName> =

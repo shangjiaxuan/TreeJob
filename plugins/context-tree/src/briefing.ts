@@ -10,12 +10,17 @@ export function renderAncestorBriefing(briefing: BriefingResult): string {
     const lines = [
       String(index + 1) + ". " + entry.path + " — " + (work.title || work.kind),
       "   Objective: " + (work.objective || "not recorded"),
+      "   Why: " + (work.rationale || "not recorded"),
       "   State: " + (work.currentState || "not recorded"),
+      "   Open questions: " + (work.openQuestions.length > 0 ? work.openQuestions.join("; ") : "none"),
       "   Return when: " + (work.returnCondition || "not specified"),
     ];
     appendReferences(lines, work.refs);
     if (entry.closedChildOutcomes.length > 0) {
-      lines.push("   Closed children: " + entry.closedChildOutcomes.join(", "));
+      lines.push("   Closed children:");
+      for (const outcome of entry.closedChildOutcomes) {
+        lines.push("     - " + outcome.path + " [" + outcome.status + "]: " + outcome.summary);
+      }
     }
     return lines.join("\n");
   });

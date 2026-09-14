@@ -1,13 +1,20 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { renderAncestorBriefing, renderMinimalPath } from "./briefing.js";
 import { callCommand, dataDir } from "./rpc.js";
-import { BriefingResultSchema, JsonSchema, PwdStateSchema, WorkPatchSchema, type CommandAtom } from "./schema.js";
+import {
+  BriefingResultSchema,
+  JsonSchema,
+  ProposalListResultSchema,
+  PwdStateSchema,
+  WorkPatchSchema,
+  type CommandAtom,
+} from "./schema.js";
 
 const HookEventSchema = z.object({
   hook_event_name: z.string().optional(),
@@ -21,6 +28,16 @@ const HookEventSchema = z.object({
 
 type HookEvent = z.infer<typeof HookEventSchema>;
 type HookJournal = DatabaseSync;
+type TranscriptDelta = {
+  path: string;
+  size: number;
+  previousOffset: number;
+  nextOffset: number;
+  prefixFingerprint: string;
+  delta: string;
+  truncated: boolean;
+  diagnostic: string;
+};
 
 const event = HookEventSchema.parse(await readStdinJson());
 const journal = openHookJournal();
@@ -46,7 +63,14 @@ async function sessionStart(value: HookEvent): Promise<void> {
   const id = sessionId(value);
   await command(id, ["pwd", value.cwd ?? process.cwd()], 8_000, eventKey(value, "SessionStart"));
   const briefing = BriefingResultSchema.parse(await command(id, ["briefing"]));
-  writeOutput(renderMinimalPath(briefing) + "\n\n" + renderAncestorBriefing(briefing));
+  const compactDecision = value.source === "compact"
+    ? ProposalListResultSchema.parse(await command(id, ["proposals"]))
+      .proposals.find((proposal) => proposal.kind === "compact")
+    : undefined;
+  const decisionContext = compactDecision
+    ? "\n\nPENDING COMPACT PROPOSAL\n" + JSON.stringify(compactDecision, null, 2)
+    : "";
+  writeOutput(renderMinimalPath(briefing) + "\n\n" + renderAncestorBriefing(briefing) + decisionContext);
 }
 
 async function subagentStart(value: HookEvent): Promise<void> {
@@ -69,15 +93,24 @@ async function subagentStop(value: HookEvent): Promise<void> {
 async function preCompact(value: HookEvent, hookJournal: HookJournal): Promise<void> {
   const id = sessionId(value);
   const state = PwdStateSchema.parse(await command(id, ["pwd"]));
-  const transcript = readTranscriptDelta(value.transcript_path);
-  const candidate = summarizeCompact(state.current_work, transcript.delta);
-  if (candidate.success) {
+  const briefing = BriefingResultSchema.parse(await command(id, ["briefing"]));
+  const transcript = readTranscriptDelta(hookJournal, id, value.transcript_path);
+  let diagnostic = transcript.diagnostic;
+  try {
+    const candidate = summarizeCompact(state.current_work, briefing, transcript.delta);
+    if (!candidate.success) {
+      diagnostic = candidate.diagnostic;
+      return;
+    }
     await command(id, ["_submit-proposal", {
       kind: "compact",
       patch: JsonSchema.parse(candidate.data),
     }], 120_000, eventKey(value, "PreCompact"));
+  } catch (error) {
+    diagnostic = message(error);
+  } finally {
+    recordCompactAttempt(hookJournal, value, transcript, diagnostic);
   }
-  recordCompactAttempt(hookJournal, value, transcript.path, transcript.size, transcript.delta, candidate.success ? "" : "compact worker unavailable");
 }
 
 async function stop(value: HookEvent): Promise<void> {
@@ -96,40 +129,91 @@ function command(
   return callCommand({ sessionId, command: [...command_] }, timeout, idempotencyKey);
 }
 
-function summarizeCompact(current: unknown, delta: string) {
+function summarizeCompact(current: unknown, briefing: unknown, delta: string): { success: true; data: unknown; diagnostic: string } | { success: false; diagnostic: string } {
   const prompt = [
     "Return a conservative JSON patch for the current continuation node.",
     "Never create nodes, move a cursor, close work, or fork.",
-    "CURRENT WORK:", JSON.stringify(current), "TRANSCRIPT DELTA:", delta,
+    "CURRENT WORK:", JSON.stringify(current), "IMMUTABLE CONTEXT LOOKBACK:", JSON.stringify(briefing), "TRANSCRIPT DELTA:", delta,
   ].join("\n");
   const result = spawnSync(process.env.CONTEXT_TREE_CODEX_BIN ?? "codex", [
     "exec", "--ephemeral", "--disable", "hooks", "--sandbox", "read-only",
     "--output-schema", fileURLToPath(new URL("./compact-schema.json", import.meta.url)), "-",
   ], { input: prompt, encoding: "utf8", timeout: 120_000 });
-  return WorkPatchSchema.safeParse(parseJson(result.stdout));
+  const parsed = WorkPatchSchema.safeParse(parseJson(result.stdout));
+  return parsed.success
+    ? { success: true, data: parsed.data, diagnostic: "" }
+    : { success: false, diagnostic: result.error?.message || "compact worker returned invalid JSON" };
 }
 
-function readTranscriptDelta(transcriptPath: string | undefined): { path: string; size: number; delta: string } {
-  if (!transcriptPath || !existsSync(transcriptPath)) return { path: transcriptPath ?? "", size: 0, delta: "" };
-  const size = statSync(transcriptPath).size;
-  return { path: transcriptPath, size, delta: readFileSync(transcriptPath).subarray(Math.max(0, size - 49_152)).toString() };
+function readTranscriptDelta(journal: HookJournal, session: string, transcriptPath: string | undefined): TranscriptDelta {
+  if (!transcriptPath || !existsSync(transcriptPath)) {
+    return {
+      path: transcriptPath ?? "", size: 0, previousOffset: 0, nextOffset: 0,
+      prefixFingerprint: "", delta: "", truncated: false, diagnostic: "transcript unavailable",
+    };
+  }
+  const path = resolve(transcriptPath);
+  const content = readFileSync(path);
+  const size = statSync(path).size;
+  const prefixFingerprint = createHash("sha256").update(content.subarray(0, 4096)).digest("hex");
+  const checkpoint = journal.prepare(
+    "SELECT byte_offset,prefix_fingerprint FROM transcript_checkpoints_v2 WHERE session_id=? AND transcript_path=?",
+  ).get(session, path) as { byte_offset?: number; prefix_fingerprint?: string } | undefined;
+  const checkpointOffset = checkpoint?.byte_offset ?? 0;
+  const valid = checkpoint !== undefined
+    && checkpointOffset <= size
+    && checkpoint.prefix_fingerprint === prefixFingerprint;
+  const previousOffset = valid ? checkpointOffset : 0;
+  const start = Math.max(previousOffset, size - 49_152);
+  return {
+    path,
+    size,
+    previousOffset,
+    nextOffset: size,
+    prefixFingerprint,
+    delta: content.subarray(start).toString(),
+    truncated: start > previousOffset,
+    diagnostic: valid || checkpoint === undefined ? "" : "transcript offset reset after rotation or fingerprint mismatch",
+  };
 }
 
 function openHookJournal(): HookJournal {
   const directory = join(dataDir(), "journal");
   mkdirSync(directory, { recursive: true });
   const output = new DatabaseSync(join(directory, "hook-journal.sqlite"));
-  output.exec("CREATE TABLE IF NOT EXISTS hook_receipts_v1(key TEXT PRIMARY KEY, transcript_path TEXT, byte_offset INTEGER, fingerprint TEXT, diagnostic TEXT, created_at TEXT NOT NULL)");
+  output.exec("CREATE TABLE IF NOT EXISTS transcript_checkpoints_v2(session_id TEXT NOT NULL,transcript_path TEXT NOT NULL,byte_offset INTEGER NOT NULL,prefix_fingerprint TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(session_id,transcript_path))");
+  output.exec("CREATE TABLE IF NOT EXISTS compact_attempts_v2(key TEXT PRIMARY KEY,session_id TEXT NOT NULL,transcript_path TEXT NOT NULL,previous_offset INTEGER NOT NULL,next_offset INTEGER NOT NULL,prefix_fingerprint TEXT NOT NULL,truncated INTEGER NOT NULL,diagnostic TEXT NOT NULL,created_at TEXT NOT NULL)");
   return output;
 }
 
-function recordCompactAttempt(journal: HookJournal, value: HookEvent, path: string, offset: number, delta: string, diagnostic: string): void {
-  journal.prepare("INSERT OR REPLACE INTO hook_receipts_v1 VALUES(?,?,?,?,?,?)").run(eventKey(value, "PreCompact"), path, offset, createHash("sha256").update(delta).digest("hex"), diagnostic, new Date().toISOString());
+function recordCompactAttempt(journal: HookJournal, value: HookEvent, transcript: TranscriptDelta, diagnostic: string): void {
+  const now = new Date().toISOString();
+  journal.exec("BEGIN IMMEDIATE");
+  try {
+    if (transcript.path) {
+      journal.prepare("INSERT OR REPLACE INTO transcript_checkpoints_v2 VALUES(?,?,?,?,?)")
+        .run(sessionId(value), transcript.path, transcript.nextOffset, transcript.prefixFingerprint, now);
+    }
+    journal.prepare("INSERT OR REPLACE INTO compact_attempts_v2 VALUES(?,?,?,?,?,?,?,?,?)")
+      .run(
+        eventKey(value, "PreCompact"), sessionId(value), transcript.path, transcript.previousOffset,
+        transcript.nextOffset, transcript.prefixFingerprint, transcript.truncated ? 1 : 0, diagnostic, now,
+      );
+    journal.exec("COMMIT");
+  } catch (error) {
+    journal.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 function sessionId(value: HookEvent): string { return value.session_id ?? ""; }
 function subagentSessionId(value: HookEvent): string { return value.agent_id ? sessionId(value) + ":agent:" + value.agent_id : sessionId(value); }
-function eventKey(value: HookEvent, kind: string): string { return createHash("sha256").update([kind, subagentSessionId(value), value.transcript_path ?? "", value.last_assistant_message ?? ""].join("|")).digest("hex"); }
+function eventKey(value: HookEvent, kind: string): string {
+  const workspace = kind === "SessionStart" ? resolve(value.cwd ?? process.cwd()) : "";
+  return createHash("sha256")
+    .update([kind, subagentSessionId(value), workspace, value.source ?? "", value.transcript_path ?? "", value.last_assistant_message ?? ""].join("|"))
+    .digest("hex");
+}
 
 function writeOutput(context?: string, systemMessage?: string): void {
   console.log(JSON.stringify({

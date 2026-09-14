@@ -282,6 +282,15 @@ export class ContinuationModel {
     return this.walk(view, this.root(view));
   }
 
+  findNodeAtView(view: View, nodeId: Id): ResolvedNode | null {
+    return this.findNode(view, nodeId);
+  }
+
+  rootNeedsInitialization(resolved: ResolvedSession): boolean {
+    const work = this.work(resolved.nodes[0]);
+    return !work.objective || !work.rationale || !work.returnCondition;
+  }
+
   history(
     sessionId: string,
     referenceRevision: number | undefined,

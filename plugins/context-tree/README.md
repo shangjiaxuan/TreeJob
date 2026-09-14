@@ -6,9 +6,9 @@ inode-like continuation identities, while stable links own historical names and
 placements. Public history is a per-session timeline (`r0`, `r1`, ...), where
 each revision is a frozen `{session, revision}` view.
 
-The plugin runtime is bundled in the checked-in dist directory. A fresh
-marketplace checkout can therefore run its MCP server and hooks on Node 22 or
-newer without installing development dependencies.
+Source checkouts contain only authored files. Build the ignored staged
+marketplace artifact before installing it in Codex; the artifact bundles its
+Node 22+ runtime and does not retain development dependencies.
 
 ## Development shell
 
@@ -100,13 +100,16 @@ historical session revision. Add `?reference=<id>` when the URL path should be
 resolved against a historical state rather than the session head. The page is
 read-only and queries the daemon instead of opening SQLite.
 
-## Runtime updates
+## Staged marketplace artifact
 
 After changing TypeScript source, run:
 
     npm run build
     npm test
     npm run validate
+    npm run package-artifact
 
-Commit the regenerated dist runtime with the source change. The plugin
-manifest, MCP launcher, and lifecycle hooks invoke that bundled runtime.
+The final command creates `../../out/context-tree-marketplace/` with a
+standalone `.agents/plugins/marketplace.json` and `plugins/context-tree`
+runtime. Install that staged marketplace, not this source checkout. `dist/`,
+generated contract metadata, and `out/` remain untracked.

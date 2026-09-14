@@ -92,6 +92,7 @@ export class RepositoryError extends Error {
 }
 
 export interface RecordRepository {
+  close(): void;
   transaction<T>(work: () => T): T;
   findSession(id: string): Session | null;
   getSession(id: string): Session;
@@ -103,6 +104,7 @@ export interface RecordRepository {
   createLink(childNodeId: Id, sessionId: string, revision: number): Link;
   getLink(id: Id): Link;
   insertNodeRecord(nodeId: Id, sessionId: string, revision: number, attributes: WorkFields): NodeRecord;
+  getNodeRecord(id: Id): NodeRecord;
   resolveNodeRecord(nodeId: Id, view: View): NodeRecord;
   nextNodeRecord(nodeId: Id, sessionId: string, revision: number): NodeRecord | null;
   insertLinkRecord(linkId: Id, sessionId: string, revision: number, parentNodeId: Id, name: string): LinkRecord;
@@ -139,6 +141,10 @@ export class SqliteRecordRepository implements RecordRepository {
       this.db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  close(): void {
+    this.db.close();
   }
 
   findSession(id: string): Session | null {
@@ -384,7 +390,7 @@ export class SqliteRecordRepository implements RecordRepository {
     );
   }
 
-  private getNodeRecord(id: Id): NodeRecord {
+  getNodeRecord(id: Id): NodeRecord {
     const row = this.one("SELECT * FROM node_records_v6 WHERE id=?", id);
     if (row === null) throw new RepositoryError("not_found", "node record not found");
     return this.nodeRecord(row);

@@ -9,16 +9,22 @@ import {
   PROTOCOL_VERSION,
   schemaDigest,
   type BriefingResult,
+  type CdResult,
+  type CloseResult,
   type CurrentDirectory,
   type CursorState,
+  type EditResult,
   type EntrySummary,
   type Id,
+  type MkdirResult,
+  type MoveResult,
   type ProposalSummary,
   type PwdState,
   type RevisionSummary,
   type RpcResponse,
   type SearchMatch,
   type WorkPatch,
+  WorkFieldsSchema,
 } from "./schema.js";
 
 /** Transactional controller for the public filesystem use cases. */
@@ -34,6 +40,10 @@ export class ContinuationController {
     const parsed = parseCommand(input);
     if (parsed.kind === "help") return parsed.result;
     return this.dispatch(parsed.name, parsed.input, idempotencyKey);
+  }
+
+  dispose(): void {
+    this.records.close();
   }
 
   dispatch(name: keyof typeof OperationSchemas, raw: unknown, idempotencyKey?: string): unknown {
@@ -93,10 +103,10 @@ export class ContinuationController {
 
   private pwd(raw: unknown, key: string | null): PwdState {
     const input = OperationSchemas.pwd.input.parse(raw);
+    const existing = this.records.findSession(input.sessionId);
+    if (existing && input.cwd) this.model.validateWorkspace(existing, input.cwd);
     return this.command(input.sessionId, key, OperationSchemas.pwd.output, () => {
-      const existing = this.records.findSession(input.sessionId);
       if (existing) {
-        if (input.cwd) this.model.validateWorkspace(existing, input.cwd);
         return this.pwdState(this.model.resolveSession(input.sessionId));
       }
       return this.pwdState(this.model.createSession(input.sessionId, input.cwd ?? process.cwd()));
@@ -128,39 +138,72 @@ export class ContinuationController {
     };
   }
 
-  private cd(raw: unknown, key: string | null): CursorState {
+  private cd(raw: unknown, key: string | null): CdResult {
     const input = OperationSchemas.cd.input.parse(raw);
-    return this.mutation(input.sessionId, key, "cd", OperationSchemas.cd.output, (resolved) =>
-      this.model.cd(resolved, input.path)
-    );
+    return this.command(input.sessionId, key, OperationSchemas.cd.output, () => {
+      const resolved = this.model.resolveSession(input.sessionId);
+      const mutation = this.model.cd(resolved, input.path);
+      const next = this.persistCursorOnly(resolved, "cd", key, mutation.cursorLinkPath);
+      return { ...this.cursorState(next), movedTo: this.model.path(this.model.current(next)) };
+    });
   }
 
-  private mkdir(raw: unknown, key: string | null): CursorState {
+  private mkdir(raw: unknown, key: string | null): MkdirResult {
     const input = OperationSchemas.mkdir.input.parse(raw);
-    return this.mutation(input.sessionId, key, "mkdir", OperationSchemas.mkdir.output, (resolved, revision) =>
-      this.model.mkdir(resolved, revision, input.name, input.work ?? {})
-    );
+    return this.command(input.sessionId, key, OperationSchemas.mkdir.output, () => {
+      const resolved = this.model.resolveSession(input.sessionId);
+      const revision = resolved.session.headRevision + 1;
+      const mutation = this.model.mkdir(resolved, revision, input.name, input.work ?? {});
+      const next = this.persistMutation(resolved, "mkdir", key, mutation.cursorLinkPath);
+      const created = this.model.resolvePath(next, input.name);
+      return { ...this.cursorState(next), created: this.entry(next.view, created) };
+    });
   }
 
-  private edit(raw: unknown, key: string | null): CursorState {
+  private edit(raw: unknown, key: string | null): EditResult {
     const input = OperationSchemas.edit.input.parse(raw);
-    return this.mutation(input.sessionId, key, "edit", OperationSchemas.edit.output, (resolved, revision) =>
-      this.model.edit(resolved, revision, input.patch)
-    );
+    this.assertNonTerminalPatch(input.patch);
+    return this.command(input.sessionId, key, OperationSchemas.edit.output, () => {
+      const resolved = this.model.resolveSession(input.sessionId);
+      const current = this.model.current(resolved);
+      const revision = resolved.session.headRevision + 1;
+      const mutation = this.model.edit(resolved, revision, input.patch);
+      const next = this.persistMutation(resolved, "edit", key, mutation.cursorLinkPath);
+      return {
+        ...this.cursorState(next),
+        updated: { path: this.model.path(current), fields: Object.keys(input.patch).sort() },
+      };
+    });
   }
 
-  private move(raw: unknown, key: string | null): CursorState {
+  private move(raw: unknown, key: string | null): MoveResult {
     const input = OperationSchemas.mv.input.parse(raw);
-    return this.mutation(input.sessionId, key, "mv", OperationSchemas.mv.output, (resolved, revision) =>
-      this.model.move(resolved, revision, input.source, input.destination)
-    );
+    return this.command(input.sessionId, key, OperationSchemas.mv.output, () => {
+      const resolved = this.model.resolveSession(input.sessionId);
+      const source = this.model.resolvePath(resolved, input.source);
+      const from = this.model.path(source);
+      const revision = resolved.session.headRevision + 1;
+      const mutation = this.model.move(resolved, revision, input.source, input.destination);
+      const next = this.persistMutation(resolved, "mv", key, mutation.cursorLinkPath);
+      const moved = this.model.findNodeAtView(next.view, source.nodeId);
+      if (moved === null) throw new RepositoryError("invariant", "moved node is not reachable");
+      return { ...this.cursorState(next), moved: { from, to: this.model.path(moved) } };
+    });
   }
 
-  private close(raw: unknown, key: string | null): CursorState {
+  private close(raw: unknown, key: string | null): CloseResult {
     const input = OperationSchemas.close.input.parse(raw);
-    return this.mutation(input.sessionId, key, "close", OperationSchemas.close.output, (resolved, revision) =>
-      this.model.close(resolved, revision, input.summary, input.status)
-    );
+    return this.command(input.sessionId, key, OperationSchemas.close.output, () => {
+      const resolved = this.model.resolveSession(input.sessionId);
+      const current = this.model.current(resolved);
+      const revision = resolved.session.headRevision + 1;
+      const mutation = this.model.close(resolved, revision, input.summary, input.status);
+      const next = this.persistMutation(resolved, "close", key, mutation.cursorLinkPath);
+      return {
+        ...this.cursorState(next),
+        closed: { path: this.model.path(current), status: input.status, summary: input.summary },
+      };
+    });
   }
 
   private search(raw: unknown) {
@@ -229,9 +272,14 @@ export class ContinuationController {
       ancestry: resolved.nodes.map((node) => ({
         path: this.model.path(node),
         work: this.model.work(node),
-        closedChildOutcomes: this.entries(resolved.view, node)
-          .filter((entry) => ["done", "abandoned", "superseded"].includes(entry.status))
-          .map((entry) => entry.title || entry.name),
+        closedChildOutcomes: this.model.entries(resolved.view, node)
+          .filter(({ child }) => ["done", "abandoned", "superseded"].includes(child.record.attributes.status))
+          .map(({ name, child }) => ({
+            path: this.model.path(child),
+            title: child.record.attributes.title || name,
+            status: child.record.attributes.status as "done" | "abandoned" | "superseded",
+            summary: child.record.attributes.currentState,
+          })),
       })),
       pendingProposalCount: this.records.listPendingProposals(input.sessionId).length,
       unresolvedCount: this.model.allNodes(resolved)
@@ -254,13 +302,24 @@ export class ContinuationController {
     return this.command(input.sessionId, key, OperationSchemas["decide-proposal"].output, () => {
       const resolved = this.model.resolveSession(input.sessionId);
       const proposal = this.records.getPendingProposal(input.proposalId, input.sessionId);
+      const candidate = input.decision === "accept" ? proposal.patch : input.replacement ?? null;
+      if (candidate !== null) this.assertNonTerminalPatch(candidate);
       const revision = resolved.session.headRevision + 1;
       const decision = this.model.decideProposal(resolved, revision, proposal, input.decision, input.replacement ?? null);
       this.records.updateProposalStatus(proposal.id, decision.status);
       const next = decision.kind === "state"
         ? this.persistMutation(resolved, "decide-proposal", key, decision.cursorLinkPath)
         : this.persistCursorOnly(resolved, "decide-proposal", key, decision.cursorLinkPath);
-      return { ...this.cursorState(next), proposalId: proposal.id, status: decision.status };
+      const finalized = { ...proposal, status: decision.status };
+      return {
+        ...this.cursorState(next),
+        proposal: this.proposal(finalized),
+        status: decision.status,
+        before: this.records.getNodeRecord(proposal.baseRecordId).attributes,
+        after: decision.kind === "state"
+          ? this.records.resolveNodeRecord(proposal.targetNodeId, next.view).attributes
+          : null,
+      };
     });
   }
 
@@ -279,24 +338,6 @@ export class ContinuationController {
         payload: { proposalId: proposal.id },
       });
       return this.proposal(proposal);
-    });
-  }
-
-  private mutation<T extends CursorState>(
-    sessionId: string,
-    key: string | null,
-    operation: string,
-    schema: z.ZodType<T>,
-    change: (resolved: ResolvedSession, revision: number) => StateMutation,
-  ): T {
-    return this.command(sessionId, key, schema, () => {
-      const resolved = this.model.resolveSession(sessionId);
-      const revision = resolved.session.headRevision + 1;
-      const mutation = change(resolved, revision);
-      const next = mutation.changed
-        ? this.persistMutation(resolved, operation, key, mutation.cursorLinkPath)
-        : this.persistCursorOnly(resolved, operation, key, mutation.cursorLinkPath);
-      return schema.parse(this.cursorState(next));
     });
   }
 
@@ -365,16 +406,14 @@ export class ContinuationController {
           .flatMap((session) => this.model.allNodesAtView(
             this.records.getSessionRevision(session.id, session.headRevision),
           ));
-    return nodes
-      .filter((node) => this.searchable(node).includes(needle))
-      .map((node) => this.searchMatch(node));
+    return nodes.flatMap((node) => this.searchMatches(node, needle));
   }
 
   private historyMatches(sessionId: string, needle: string): SearchMatch[] {
     return this.records.listSessionRevisions(sessionId).flatMap((revision) => {
       return this.model.allNodesAtView(revision)
-        .filter((node) => this.searchable(node).includes(needle))
-        .map((node) => ({ ...this.searchMatch(node), revision: revision.revision }));
+        .flatMap((node) => this.searchMatches(node, needle)
+          .map((match) => ({ ...match, revision: revision.revision })));
     });
   }
 
@@ -401,6 +440,17 @@ export class ContinuationController {
     }));
   }
 
+  private entry(view: View, node: ResolvedNode): EntrySummary & { path: string } {
+    return {
+      name: node.names.at(-1) ?? "/",
+      path: this.model.path(node),
+      kind: node.record.attributes.kind,
+      title: node.record.attributes.title,
+      status: node.record.attributes.status,
+      hasChildren: this.model.entries(view, node).length > 0,
+    };
+  }
+
   private revisionSummary(
     revision: SessionRevision,
     changes: RevisionSummary["changes"],
@@ -409,29 +459,61 @@ export class ContinuationController {
   }
 
   private proposal(proposal: Proposal): ProposalSummary {
+    const source = this.records.getSessionRevision(proposal.sessionId, proposal.sourceRevision);
+    const target = this.model.findNodeAtView(source, proposal.targetNodeId);
+    if (target === null) throw new RepositoryError("invariant", "proposal target is not reachable");
+    const baseWork = this.records.getNodeRecord(proposal.baseRecordId).attributes;
     return {
       proposalId: proposal.id,
       kind: proposal.kind,
       status: proposal.status,
       createdAt: proposal.createdAt,
       sourceSessionId: proposal.sourceSessionId,
+      targetPath: this.model.path(target),
+      baseWork,
       patch: proposal.patch,
+      afterPreview: proposal.patch === null ? null : WorkFieldsSchema.parse({ ...baseWork, ...proposal.patch }),
     };
   }
 
-  private searchMatch(node: ResolvedNode): SearchMatch {
-    return {
-      path: this.model.path(node),
-      name: node.names.at(-1) ?? "/",
-      work: this.model.work(node),
-    };
-  }
-
-  private searchable(node: ResolvedNode): string {
+  private searchMatches(node: ResolvedNode, needle: string): SearchMatch[] {
     const work = this.model.work(node);
-    return [this.model.path(node), work.kind, work.title, work.objective, work.rationale, work.currentState]
-      .join("\n")
-      .toLocaleLowerCase();
+    const fields: Array<[string, string]> = [
+      ["path", this.model.path(node)],
+      ["kind", work.kind],
+      ["title", work.title],
+      ["objective", work.objective],
+      ["rationale", work.rationale],
+      ["currentState", work.currentState],
+      ["openQuestions", work.openQuestions.join("\n")],
+      ["returnCondition", work.returnCondition],
+      ["refs", JSON.stringify(work.refs)],
+      ["metadata", JSON.stringify(work.metadata)],
+    ];
+    return fields.flatMap(([field, value]) => {
+      const index = value.toLocaleLowerCase().indexOf(needle);
+      if (index < 0) return [];
+      return [{
+        path: this.model.path(node),
+        name: node.names.at(-1) ?? "/",
+        field,
+        snippet: this.snippet(value, index, needle.length),
+        status: work.status,
+      }];
+    });
+  }
+
+  private snippet(value: string, index: number, length: number): string {
+    const radius = 72;
+    const start = Math.max(0, index - radius);
+    const end = Math.min(value.length, index + length + radius);
+    return (start > 0 ? "…" : "") + value.slice(start, end) + (end < value.length ? "…" : "");
+  }
+
+  private assertNonTerminalPatch(patch: WorkPatch): void {
+    if (patch.status && ["done", "abandoned", "superseded"].includes(patch.status)) {
+      throw new RepositoryError("invariant", "terminal status must be set with close");
+    }
   }
 
   private sessionIdFrom(raw: unknown): string | null {
@@ -513,6 +595,10 @@ export class FilesystemOperations {
 
   execute(raw: unknown, idempotencyKey?: string): unknown {
     return this.controller.execute(raw, idempotencyKey);
+  }
+
+  dispose(): void {
+    this.controller.dispose();
   }
 
   failure(id: string, error: unknown): RpcResponse {
