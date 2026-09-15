@@ -2,7 +2,7 @@ import { homedir, platform } from "node:os";
 import { join } from "node:path";
 
 export const DEFAULT_MCP_PORT = 43_177;
-export const SERVICE_VERSION = "0.8.0";
+export const SERVICE_VERSION = "0.9.0";
 
 export type DaemonConfiguration = {
   dataDirectory: string;
@@ -29,7 +29,7 @@ export function dataDirectory(): string {
 }
 
 export function databaseFile(directory = dataDirectory()): string {
-  return join(directory, "context-tree-v7.sqlite");
+  return join(directory, "context-tree-v8.sqlite");
 }
 
 export function runtimeDirectory(): string {

@@ -19,14 +19,17 @@ as `{ sessionId: "session", command: ["mkdir", "investigate", {"returnCondition"
   navigation; `close` pops to the parent. Request `briefing` after compact or a
   significant detour.
 - Public revisions are session revisions (`r0`, `r1`, ...), not node IDs. Use
-  `rev-list [path]` for semantic history and `rev-show <revision> [path]` for a
-  historical view. A path normally resolves at the current head, so it follows
-  a moved or renamed node; add `--reference=N` only when a historical path is
-  the intended identity source.
-- Do not infer storage details from revision output. Inode identities, node
-  work history, link topology history, and their as-of resolvers are daemon
-  internals. A session revision is the fixed historical view that selects the
-  effective node and link states.
+  `rev-list [path]` for semantic history and `rev-show [revision] [path]` for a
+  current-head or historical view. Add `--verbose` only when the originating session/revision
+  view for a node state is needed. Use `query-link parent [path]` or
+  `query-link child [path]` for stable directory-link history. A path normally
+  resolves at the current head, so it follows a moved or renamed node; add
+  `--reference=N` only when a historical path is the intended identity source.
+- Do not infer storage details from revision output. Inode and link identities,
+  scratch physical records, published-reference streams, and frozen fork spans
+  are daemon internals. A session revision is the fixed historical view that
+  selects effective published node and link records; diagnostic events are not
+  part of state resolution.
 - Keep material engineering facts in dated logs/ and mature conclusions in
   notes/; record their paths in node references. Context Tree is the
   continuation cursor and pointer layer, not the authority for those facts.

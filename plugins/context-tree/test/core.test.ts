@@ -15,9 +15,12 @@ import { ContinuationController } from "../src/daemon/service/application/daemon
 import { SqliteRecordRepository } from "../src/daemon/service/persistence/record-repository.js";
 import { DaemonLaunchGate, DaemonRegistryOwner } from "../src/daemon/runtime/registry.js";
 import { configuredEndpoint } from "../src/clients/transport.js";
+import { renderBrowsePage } from "../src/clients/browser/browse-view.js";
+import type { BrowserView } from "../src/clients/browser/browse-data.js";
 
 type Context = {
   controller: ContinuationController;
+  repository: SqliteRecordRepository;
   directory: string;
   cleanup(): void;
 };
@@ -27,6 +30,7 @@ function createContext(): Context {
   const repository = new SqliteRecordRepository(join(directory, "context-tree.sqlite"));
   return {
     controller: new ContinuationController(repository),
+    repository,
     directory,
     cleanup() {
       repository.close();
@@ -64,23 +68,183 @@ test("pwd is detailed while mutations return compact affected-state acknowledgem
   }
 });
 
-test("session events use one validated JSON document with indexed revisions", () => {
+test("published references own revisions while events remain diagnostic", () => {
   const context = createContext();
   let database: DatabaseSync | undefined;
 
   try {
     command(context.controller, "session", ["pwd", "C:/work"]);
     command(context.controller, "session", ["edit", { currentState: "recorded" }]);
+    const head = context.repository.getHeadSessionView("session");
     database = new DatabaseSync(join(context.directory, "context-tree.sqlite"));
-    const columns = database.prepare("PRAGMA table_info(session_events_v7)").all() as Array<{ name: string }>;
+    const revisions = database.prepare(
+      "SELECT revision FROM session_revisions_v8 WHERE session_id=? ORDER BY revision",
+    ).all("session") as Array<{ revision: number }>;
+    const reference = database.prepare(
+      "SELECT record_id FROM published_node_refs_v8 WHERE session_id=? AND inode_id=? AND revision=?",
+    ).get("session", head.view.rootNodeId, 1) as { record_id: number } | undefined;
     const event = database.prepare(
-      "SELECT revision,event_json FROM session_events_v7 WHERE session_id=? AND revision=?",
+      "SELECT revision,event_json FROM session_events_v8 WHERE session_id=? AND revision=?",
     ).get("session", 1) as { revision: number; event_json: string } | undefined;
-    assert.deepEqual(columns.map((column) => column.name), ["sequence", "session_id", "revision", "event_json"]);
+    const plan = database.prepare(
+      "EXPLAIN QUERY PLAN SELECT record_id FROM published_node_refs_v8 WHERE session_id=? AND inode_id=? AND revision>=? AND revision<=? ORDER BY revision DESC LIMIT 1",
+    ).all("session", head.view.rootNodeId, 0, 1) as Array<{ detail: string }>;
+    assert.deepEqual(revisions.map((row) => row.revision), [0, 1]);
+    assert.equal(typeof reference?.record_id, "number");
     assert.equal(event?.revision, 1);
     assert.equal(JSON.parse(event?.event_json ?? "{}").action, "edit");
+    assert.ok(plan.every((row) => row.detail.includes("SEARCH") && !row.detail.includes("SCAN") && !row.detail.includes("JOIN")));
   } finally {
     database?.close();
+    context.cleanup();
+  }
+});
+
+test("payload edits and topology edits publish independent record streams", () => {
+  const context = createContext();
+  let database: DatabaseSync | undefined;
+
+  try {
+    command(context.controller, "session", ["pwd", "C:/work"]);
+    command(context.controller, "session", ["mkdir", "child", { returnCondition: "finish" }]);
+    command(context.controller, "session", ["cd", "child"]);
+    command(context.controller, "session", ["edit", { currentState: "changed" }]);
+
+    const root = context.repository.getSessionRevision("session", 0);
+    const child = context.repository.getSessionRevision("session", 2);
+    const rootRecord = context.repository.resolveNodeRecord(root.rootNodeId, root);
+    const [entry] = context.repository.listEffectiveLinks(root.rootNodeId, child);
+    assert.ok(entry);
+    const childNode = command(context.controller, "session", ["pwd"]);
+    const childRecord = context.repository.resolveNodeRecord(
+      entry.childNodeId,
+      child,
+    );
+
+    assert.equal(rootRecord.id, context.repository.resolveNodeRecord(root.rootNodeId, child).id);
+    assert.equal(childRecord.attributes.currentState, "changed");
+    assert.equal(childNode.current_work.currentState, "changed");
+
+    database = new DatabaseSync(join(context.directory, "context-tree.sqlite"));
+    const nodeColumns = database.prepare("PRAGMA table_info(node_records_v8)").all() as Array<{ name: string }>;
+    const plans = [
+      database.prepare(
+        "EXPLAIN QUERY PLAN SELECT * FROM session_spans_v8 WHERE session_id=? AND first_revision<=? ORDER BY first_revision DESC LIMIT 1",
+      ).all("session", 2),
+      database.prepare(
+        "EXPLAIN QUERY PLAN SELECT link_id,record_id,revision FROM published_link_refs_v8 WHERE session_id=? AND parent_inode_id=? AND revision>=? AND revision<=? ORDER BY revision DESC",
+      ).all("session", root.rootNodeId, 0, 2),
+    ] as Array<Array<{ detail: string }>>;
+
+    assert.ok(!nodeColumns.some((column) => column.name === "work_json"));
+    assert.ok(plans.flat().every((row) => row.detail.includes("SEARCH") && !row.detail.includes("SCAN") && !row.detail.includes("JOIN")));
+  } finally {
+    database?.close();
+    context.cleanup();
+  }
+});
+
+test("moved links suppress their former parent without rewriting node work", () => {
+  const context = createContext();
+
+  try {
+    command(context.controller, "session", ["pwd", "C:/work"]);
+    command(context.controller, "session", ["mkdir", "source", { returnCondition: "finish" }]);
+    command(context.controller, "session", ["mkdir", "destination", { returnCondition: "finish" }]);
+    command(context.controller, "session", ["mv", "/source", "/destination/source"]);
+
+    const root = command(context.controller, "session", ["ls", "/"]);
+    const destination = command(context.controller, "session", ["ls", "/destination"]);
+
+    assert.deepEqual(root.entries.map((entry: { name: string }) => entry.name), ["destination"]);
+    assert.deepEqual(destination.entries.map((entry: { name: string }) => entry.name), ["source"]);
+  } finally {
+    context.cleanup();
+  }
+});
+
+test("verbose revision and link queries expose their concrete creating views", () => {
+  const context = createContext();
+
+  try {
+    command(context.controller, "session", ["pwd", "C:/work"]);
+    command(context.controller, "session", ["mkdir", "test", { returnCondition: "finish" }]);
+    command(context.controller, "session", ["mv", "/test", "/renamed"]);
+
+    const concise = command(context.controller, "session", ["rev-list", "renamed"]);
+    const verbose = command(context.controller, "session", ["rev-list", "renamed", "--verbose"]);
+    const links = command(context.controller, "session", [
+      "query-link",
+      "parent",
+      "renamed",
+      "--revision",
+      "2",
+      "--reference",
+      "2",
+    ]);
+
+    assert.ok(concise.revisions.every((revision: { created_view?: unknown }) => revision.created_view === undefined));
+    assert.deepEqual(
+      verbose.revisions.map((revision: { revision: number; created_view?: { sessionId: string; revision: number } }) => ({
+        revision: revision.revision,
+        createdView: revision.created_view,
+      })),
+      [
+        { revision: 1, createdView: { sessionId: "session", revision: 1 } },
+        { revision: 2, createdView: { sessionId: "session", revision: 1 } },
+      ],
+    );
+    assert.deepEqual(links.links, [{
+      name: "renamed",
+      revisions: [
+        { created_view: { sessionId: "session", revision: 1 }, name: "test", createdAt: links.links[0].revisions[0].createdAt },
+        { created_view: { sessionId: "session", revision: 2 }, name: "renamed", createdAt: links.links[0].revisions[1].createdAt },
+      ],
+    }]);
+  } finally {
+    context.cleanup();
+  }
+});
+
+test("browser links retain explicit session query semantics without cookies", () => {
+  const view: BrowserView = {
+    sessionId: "browser-session",
+    currentPath: "/",
+    referencePath: "/",
+    headRevision: 3,
+    hasExplicitView: false,
+    selectedRevision: { revision: 3, createdAt: "2026-09-15T00:00:00.000Z", changes: [] },
+    referenceRevision: 3,
+    work: {
+      kind: "node", title: "", objective: "", rationale: "", currentState: "", openQuestions: [],
+      returnCondition: "", refs: [], metadata: {}, status: "open",
+    },
+    entries: [],
+    nodeRevisions: [],
+    tree: { name: "/", path: "/", title: "", status: "open", children: [] },
+  };
+  const page = renderBrowsePage(view);
+
+  assert.match(page, /\/browse\/\?sessionId=browser-session/);
+  assert.doesNotMatch(page, /logout|Set-Cookie/);
+  assert.match(page, /max=\"3\"/);
+});
+
+test("rev-show without a revision reads a path from the lightweight session head", () => {
+  const context = createContext();
+
+  try {
+    command(context.controller, "session", ["pwd", "C:/work"]);
+    command(context.controller, "session", ["mkdir", "child", {
+      currentState: "current work",
+      returnCondition: "finish",
+    }]);
+    const shown = command(context.controller, "session", ["rev-show", "/child"]);
+
+    assert.equal(shown.details.revision.revision, 1);
+    assert.equal(shown.details.view_path, "/child");
+    assert.equal(shown.details.work.currentState, "current work");
+  } finally {
     context.cleanup();
   }
 });
@@ -117,7 +281,7 @@ test("daemon ownership and startup are exclusive across data directories", () =>
     assert.equal(first.acquire(), true);
     assert.equal(second.acquire(), false);
     first.close();
-    writeFileSync(join(runtime, "daemon-v7.json"), JSON.stringify({
+    writeFileSync(join(runtime, "daemon-v8.json"), JSON.stringify({
       endpoint: "http://127.0.0.1:45124/mcp",
       pid: 999_999,
       dataDirectoryFingerprint: "stale",

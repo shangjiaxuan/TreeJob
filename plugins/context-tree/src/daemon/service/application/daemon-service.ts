@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { parseCommand } from "./command-registry.js";
 import { ContinuationModel, type ResolvedNode, type ResolvedSession } from "../domain/continuation-model.js";
-import { RepositoryError, type Id, type Proposal, type RecordRepository, type SessionEventDocument, type SessionRevision, type View } from "../persistence/record-repository.js";
+import { RepositoryError, type Id, type LinkRecord, type NodeRecord, type Proposal, type RecordRepository, type SessionEventDocument, type SessionRevision, type View } from "../persistence/record-repository.js";
 import { writeDiagnostic } from "../../runtime/diagnostics.js";
 import {
   CommandInputSchema,
@@ -16,6 +16,7 @@ import {
   type MoveResult,
   type ProposalSummary,
   type PwdState,
+  type QueryLinkResult,
   type RevisionSummary,
   type SearchMatch,
   type WorkPatch,
@@ -69,6 +70,7 @@ export class ContinuationController {
       case "close": return this.close(raw, key);
       case "search": return this.search(raw);
       case "rev-list": return this.revisionList(raw);
+      case "query-link": return this.queryLink(raw);
       case "rev-show": return this.revisionShow(raw);
       case "fork": return this.fork(raw, key);
       case "briefing": return this.briefing(raw);
@@ -87,7 +89,11 @@ export class ContinuationController {
         return this.pwdState(this.model.resolveSession(input.sessionId));
       }
       const created = this.model.createSession(input.sessionId, input.cwd ?? process.cwd());
-      this.appendEvent(input.sessionId, 0, "session-created", created.rootNodeId, created.cursorLinkPath, key, {});
+      const revision = this.records.reserveNextRevision(input.sessionId);
+      this.records.insertSpan(input.sessionId, revision, null);
+      this.records.publishReferences(input.sessionId, revision, created.nodeRecords, []);
+      this.records.updateSessionHead(input.sessionId, revision, created.cursorLinkPath);
+      this.appendEvent(input.sessionId, revision, "session-created", created.rootNodeId, created.cursorLinkPath, key, {});
       return this.pwdState(this.model.resolveSession(input.sessionId));
     });
   }
@@ -131,9 +137,8 @@ export class ContinuationController {
     const input = OperationSchemas.mkdir.input.parse(raw);
     return this.command(input.sessionId, key, OperationSchemas.mkdir.output, () => {
       const resolved = this.model.resolveSession(input.sessionId);
-      const revision = resolved.session.headRevision + 1;
-      const mutation = this.model.mkdir(resolved, revision, input.name, input.work ?? {});
-      const next = this.persistMutation(resolved, "mkdir", key, mutation.cursorLinkPath);
+      const mutation = this.model.mkdir(resolved, input.name, input.work ?? {});
+      const next = this.persistMutation(resolved, "mkdir", key, mutation);
       const created = this.model.resolvePath(next, input.name);
       return { ...this.cursorState(next), created: this.entry(next.view, created) };
     });
@@ -145,9 +150,8 @@ export class ContinuationController {
     return this.command(input.sessionId, key, OperationSchemas.edit.output, () => {
       const resolved = this.model.resolveSession(input.sessionId);
       const current = this.model.current(resolved);
-      const revision = resolved.session.headRevision + 1;
-      const mutation = this.model.edit(resolved, revision, input.patch);
-      const next = this.persistMutation(resolved, "edit", key, mutation.cursorLinkPath);
+      const mutation = this.model.edit(resolved, input.patch);
+      const next = this.persistMutation(resolved, "edit", key, mutation);
       return {
         ...this.cursorState(next),
         updated: { path: this.model.path(current), fields: Object.keys(input.patch).sort() },
@@ -161,9 +165,8 @@ export class ContinuationController {
       const resolved = this.model.resolveSession(input.sessionId);
       const source = this.model.resolvePath(resolved, input.source);
       const from = this.model.path(source);
-      const revision = resolved.session.headRevision + 1;
-      const mutation = this.model.move(resolved, revision, input.source, input.destination);
-      const next = this.persistMutation(resolved, "mv", key, mutation.cursorLinkPath);
+      const mutation = this.model.move(resolved, input.source, input.destination);
+      const next = this.persistMutation(resolved, "mv", key, mutation);
       const moved = this.model.findNodeAtView(next.view, source.nodeId);
       if (moved === null) throw new RepositoryError("invariant", "moved node is not reachable");
       return { ...this.cursorState(next), moved: { from, to: this.model.path(moved) } };
@@ -175,9 +178,8 @@ export class ContinuationController {
     return this.command(input.sessionId, key, OperationSchemas.close.output, () => {
       const resolved = this.model.resolveSession(input.sessionId);
       const current = this.model.current(resolved);
-      const revision = resolved.session.headRevision + 1;
-      const mutation = this.model.close(resolved, revision, input.summary, input.status);
-      const next = this.persistMutation(resolved, "close", key, mutation.cursorLinkPath);
+      const mutation = this.model.close(resolved, input.summary, input.status);
+      const next = this.persistMutation(resolved, "close", key, mutation);
       return {
         ...this.cursorState(next),
         closed: { path: this.model.path(current), status: input.status, summary: input.summary },
@@ -198,14 +200,58 @@ export class ContinuationController {
   private revisionList(raw: unknown) {
     const input = OperationSchemas["rev-list"].input.parse(raw);
     const resolved = this.model.resolveSession(input.sessionId);
-    const revisions = this.model.history(input.sessionId, input.reference, input.path ?? ".")
-      .map(({ revision, changes }) => this.revisionSummary(revision, changes));
+    const revisions = this.model.history(input.sessionId, input.reference, input.path ?? ".", input.verbose)
+      .map(({ revision, changes, createdView }) => this.revisionSummary(revision, changes, createdView));
     return { ...this.cursorState(resolved), head_revision: resolved.session.headRevision, revisions };
+  }
+
+  private queryLink(raw: unknown): QueryLinkResult {
+    const input = OperationSchemas["query-link"].input.parse(raw);
+    const live = this.model.resolveSession(input.sessionId);
+    const history = this.model.linkHistory(
+      input.sessionId,
+      input.direction,
+      input.revision,
+      input.reference,
+      input.path ?? ".",
+    );
+    return {
+      ...this.cursorState(live),
+      view: { sessionId: history.view.sessionId, revision: history.view.revision },
+      node_path: this.model.path(history.node),
+      direction: input.direction,
+      links: history.links.map((link) => ({
+        name: link.name,
+        revisions: link.records.map((record) => ({
+          created_view: { sessionId: record.sessionId, revision: record.revision },
+          name: record.name,
+          createdAt: record.createdAt,
+        })),
+      })),
+    };
   }
 
   private revisionShow(raw: unknown) {
     const input = OperationSchemas["rev-show"].input.parse(raw);
     const resolved = this.model.resolveSession(input.sessionId);
+
+    if (input.revision === undefined) {
+      if (input.reference !== undefined) {
+        throw new RepositoryError("invariant", "rev-show --reference requires a selected revision");
+      }
+
+      const node = this.model.resolvePath(resolved, input.path ?? ".");
+      return {
+        ...this.cursorState(resolved),
+        details: {
+          revision: this.revisionSummary(resolved.view, []),
+          view_path: this.model.path(node),
+          work: this.model.work(node),
+          entries: this.entries(resolved.view, node),
+        },
+      };
+    }
+
     const view = this.model.resolveView(
       input.sessionId,
       input.revision,
@@ -232,9 +278,13 @@ export class ContinuationController {
       const existing = this.records.findSession(input.newSessionId);
       const forked = this.model.fork(before, input.newSessionId);
       if (existing === null) {
+        const revision = this.records.reserveNextRevision(input.newSessionId);
+        this.records.insertSpan(input.newSessionId, revision, before.view);
+        this.records.publishReferences(input.newSessionId, revision, forked.nodeRecords, []);
+        this.records.updateSessionHead(input.newSessionId, revision, forked.cursorLinkPath);
         this.appendEvent(
           input.newSessionId,
-          0,
+          revision,
           "fork-created",
           forked.rootNodeId,
           forked.cursorLinkPath,
@@ -289,11 +339,14 @@ export class ContinuationController {
       const proposal = this.records.getPendingProposal(input.proposalId, input.sessionId);
       const candidate = input.decision === "accept" ? proposal.patch : input.replacement ?? null;
       if (candidate !== null) this.assertNonTerminalPatch(candidate);
-      const revision = resolved.session.headRevision + 1;
-      const decision = this.model.decideProposal(resolved, revision, proposal, input.decision, input.replacement ?? null);
+      const decision = this.model.decideProposal(resolved, proposal, input.decision, input.replacement ?? null);
       this.records.updateProposalStatus(proposal.id, decision.status);
       const next = decision.kind === "state"
-        ? this.persistMutation(resolved, "decide-proposal", key, decision.cursorLinkPath)
+        ? this.persistMutation(resolved, "decide-proposal", key, {
+          cursorLinkPath: decision.cursorLinkPath,
+          nodeRecords: decision.nodeRecords,
+          linkRecords: [],
+        })
         : this.persistCursorOnly(resolved, "decide-proposal", key, decision.cursorLinkPath);
       const finalized = { ...proposal, status: decision.status };
       return {
@@ -355,11 +408,16 @@ export class ContinuationController {
     resolved: ResolvedSession,
     operation: string,
     key: string | null,
-    cursorLinkPath: Id[],
+    mutation: {
+      cursorLinkPath: Id[];
+      nodeRecords: readonly NodeRecord[];
+      linkRecords: readonly { record: LinkRecord; previousParentNodeId: Id | null }[];
+    },
   ): ResolvedSession {
-    const revision = resolved.session.headRevision + 1;
-    this.records.updateSessionHead(resolved.session.id, revision, cursorLinkPath);
-    this.appendEvent(resolved.session.id, revision, operation, resolved.view.rootNodeId, cursorLinkPath, key, {});
+    const revision = this.records.reserveNextRevision(resolved.session.id);
+    this.records.publishReferences(resolved.session.id, revision, mutation.nodeRecords, mutation.linkRecords);
+    this.records.updateSessionHead(resolved.session.id, revision, mutation.cursorLinkPath);
+    this.appendEvent(resolved.session.id, revision, operation, resolved.view.rootNodeId, mutation.cursorLinkPath, key, {});
     return this.model.resolveSession(resolved.session.id);
   }
 
@@ -436,8 +494,10 @@ export class ContinuationController {
   private revisionSummary(
     revision: SessionRevision,
     changes: RevisionSummary["changes"],
+    created_view?: RevisionSummary["created_view"],
   ): RevisionSummary {
-    return { revision: revision.revision, createdAt: revision.createdAt, changes };
+    const summary = { revision: revision.revision, createdAt: revision.createdAt, changes };
+    return created_view === undefined ? summary : { ...summary, created_view };
   }
 
   private proposal(proposal: Proposal): ProposalSummary {

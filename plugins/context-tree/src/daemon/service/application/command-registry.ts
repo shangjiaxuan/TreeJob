@@ -42,7 +42,7 @@ type CommandDefinition = {
 
 type ParsedArguments = {
   positionals: CommandAtom[];
-  options: Map<string, string>;
+  options: Map<string, string | true>;
 };
 
 const definitions: readonly CommandDefinition[] = [
@@ -109,14 +109,21 @@ const definitions: readonly CommandDefinition[] = [
   command(
     "rev-list",
     "List session revision history for the current node or a path.",
-    "rev-list [path] [--reference=N]",
+    "rev-list [path] [--reference=N] [--verbose]",
     "rev-list",
     (sessionId, args) => revisionListInput(sessionId, args),
   ),
   command(
+    "query-link",
+    "List parent or direct-child link records for a node in a selected view.",
+    "query-link <parent|child> [path] [--revision=N] [--reference=N]",
+    "query-link",
+    (sessionId, args) => queryLinkInput(sessionId, args),
+  ),
+  command(
     "rev-show",
-    "Show a path at a selected historical session revision.",
-    "rev-show <revision> [path] [--reference=N]",
+    "Show a path at the current head or a selected historical session revision.",
+    "rev-show [revision] [path] [--reference=N]",
     "rev-show",
     (sessionId, args) => revisionShowInput(sessionId, args),
   ),
@@ -207,7 +214,7 @@ export function parseCommand(input: CommandInput): ParsedCommand {
     throw new Error("sessionId is required for command: " + commandName);
   }
 
-  if (!["search", "ls", "rev-list", "rev-show"].includes(definition.name)) {
+  if (!["search", "ls", "rev-list", "rev-show", "query-link"].includes(definition.name)) {
     rejectLongOptions(arguments_);
   }
 
@@ -275,11 +282,25 @@ function listInput(sessionId: string, arguments_: readonly CommandAtom[]): unkno
 
 function revisionListInput(sessionId: string, arguments_: readonly CommandAtom[]): unknown {
   const parsed = splitOptions(arguments_);
-  ensureOptions(parsed.options, ["reference"]);
+  ensureOptions(parsed.options, ["reference", "verbose"]);
   requireArgumentCount(parsed.positionals, 0, 1);
   return {
     sessionId,
     path: optionalString(parsed.positionals, 0, "path"),
+    reference: optionRevision(parsed.options, "reference"),
+    verbose: optionFlag(parsed.options, "verbose"),
+  };
+}
+
+function queryLinkInput(sessionId: string, arguments_: readonly CommandAtom[]): unknown {
+  const parsed = splitOptions(arguments_);
+  ensureOptions(parsed.options, ["revision", "reference"]);
+  requireArgumentCount(parsed.positionals, 1, 2);
+  return {
+    sessionId,
+    direction: requiredString(parsed.positionals, 0, "direction"),
+    path: optionalString(parsed.positionals, 1, "path"),
+    revision: optionRevision(parsed.options, "revision"),
     reference: optionRevision(parsed.options, "reference"),
   };
 }
@@ -287,11 +308,20 @@ function revisionListInput(sessionId: string, arguments_: readonly CommandAtom[]
 function revisionShowInput(sessionId: string, arguments_: readonly CommandAtom[]): unknown {
   const parsed = splitOptions(arguments_);
   ensureOptions(parsed.options, ["reference"]);
-  requireArgumentCount(parsed.positionals, 1, 2);
+  requireArgumentCount(parsed.positionals, 0, 2);
+  const first = parsed.positionals[0];
+  const firstIsRevision = typeof first === "number" || typeof first === "string" && /^\d+$/.test(first);
+
+  if (!firstIsRevision && parsed.positionals.length === 2) {
+    throw new Error("rev-show accepts a path alone or a revision followed by a path");
+  }
+
   return {
     sessionId,
-    revision: revision(parsed.positionals[0], "revision"),
-    path: optionalString(parsed.positionals, 1, "path"),
+    revision: firstIsRevision ? revision(first, "revision") : undefined,
+    path: firstIsRevision
+      ? optionalString(parsed.positionals, 1, "path")
+      : optionalString(parsed.positionals, 0, "path"),
     reference: optionRevision(parsed.options, "reference"),
   };
 }
@@ -306,7 +336,7 @@ function rejectLongOptions(arguments_: readonly CommandAtom[]): void {
 
 function splitOptions(arguments_: readonly CommandAtom[]): ParsedArguments {
   const positionals: CommandAtom[] = [];
-  const options = new Map<string, string>();
+  const options = new Map<string, string | true>();
 
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
@@ -325,19 +355,20 @@ function splitOptions(arguments_: readonly CommandAtom[]): ParsedArguments {
     const name = match[1];
     let value = match[2];
 
+    if (options.has(name)) {
+      throw new Error("option was specified twice: --" + name);
+    }
+
     if (value === undefined) {
       const next = arguments_[index + 1];
 
       if (typeof next !== "string" || next.startsWith("--")) {
-        throw new Error("value is required for --" + name);
+        options.set(name, true);
+        continue;
       }
 
       value = next;
       index += 1;
-    }
-
-    if (options.has(name)) {
-      throw new Error("option was specified twice: --" + name);
     }
 
     options.set(name, value);
@@ -346,7 +377,7 @@ function splitOptions(arguments_: readonly CommandAtom[]): ParsedArguments {
   return { positionals, options };
 }
 
-function ensureOptions(options: ReadonlyMap<string, string>, allowed: readonly string[]): void {
+function ensureOptions(options: ReadonlyMap<string, string | true>, allowed: readonly string[]): void {
   for (const name of options.keys()) {
     if (!allowed.includes(name)) {
       throw new Error("unknown option: --" + name);
@@ -432,9 +463,16 @@ function revision(value: CommandAtom | undefined, label: string): number {
   throw new Error(label + " must be a non-negative integer");
 }
 
-function optionRevision(options: ReadonlyMap<string, string>, name: string): number | undefined {
+function optionRevision(options: ReadonlyMap<string, string | true>, name: string): number | undefined {
   const value = options.get(name);
   return value === undefined ? undefined : revision(value, "--" + name);
+}
+
+function optionFlag(options: ReadonlyMap<string, string | true>, name: string): boolean {
+  const value = options.get(name);
+  if (value === undefined) return false;
+  if (value !== true) throw new Error("--" + name + " does not take a value");
+  return true;
 }
 
 function requiredObject(arguments_: readonly CommandAtom[], index: number, label: string): Record<string, JsonValue> {

@@ -23,8 +23,8 @@ export class DaemonRegistryOwner {
     private readonly dataDirectory: string,
     runtimeDirectory = dataDirectory,
   ) {
-    this.lockDirectory = join(runtimeDirectory, "daemon-v7.owner.lock");
-    this.registryFile = join(runtimeDirectory, "daemon-v7.json");
+    this.lockDirectory = join(runtimeDirectory, "daemon-v8.owner.lock");
+    this.registryFile = join(runtimeDirectory, "daemon-v8.json");
   }
 
   acquire(): boolean {
@@ -141,7 +141,7 @@ export class DaemonLaunchGate {
   private ownsLock = false;
 
   constructor(runtimeDirectory: string) {
-    this.lockFile = join(runtimeDirectory, "daemon-v7.launch.lock");
+    this.lockFile = join(runtimeDirectory, "daemon-v8.launch.lock");
   }
 
   acquire(): boolean {

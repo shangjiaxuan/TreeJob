@@ -3,7 +3,6 @@ import { URL } from "node:url";
 import { readBrowserView } from "./browse-data.js";
 import { renderBrowsePage, renderLoginPage } from "./browse-view.js";
 
-const cookieName = "context_tree_session";
 const options = parseOptions(process.argv.slice(2));
 
 if (options.dataDir !== null) {
@@ -30,47 +29,20 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
 
   const target = new URL(request.url ?? "/", "http://127.0.0.1");
 
-  if (target.pathname === "/logout") {
-    response.setHeader("Set-Cookie", cookieName + "=; Path=/; Max-Age=0; SameSite=Strict; HttpOnly");
-    redirect(response, "/");
-    return;
-  }
-
-  if (target.pathname === "/login") {
-    const sessionId = target.searchParams.get("sessionId")?.trim() ?? "";
-
-    if (sessionId.length === 0) {
-      html(response, 400, renderLoginPage("A session ID is required."));
-      return;
-    }
-
-    response.setHeader(
-      "Set-Cookie",
-      cookieName + "=" + encodeURIComponent(sessionId) + "; Path=/; SameSite=Strict; HttpOnly",
-    );
-    redirect(response, "/browse/");
-    return;
-  }
-
-  const sessionId = cookie(request, cookieName);
-
-  if (!sessionId) {
-    if (target.pathname === "/" || target.pathname.startsWith("/browse")) {
-      html(response, 200, renderLoginPage());
-      return;
-    }
-
-    respond(response, 404, "Not found", "text/plain; charset=utf-8");
-    return;
-  }
-
   if (target.pathname === "/") {
-    redirect(response, "/browse/");
+    html(response, 200, renderLoginPage());
     return;
   }
 
   if (!target.pathname.startsWith("/browse/")) {
     respond(response, 404, "Not found", "text/plain; charset=utf-8");
+    return;
+  }
+
+  const sessionId = target.searchParams.get("sessionId")?.trim() ?? "";
+
+  if (sessionId.length === 0) {
+    html(response, 400, renderLoginPage("A session ID query parameter is required."));
     return;
   }
 
@@ -145,28 +117,6 @@ function parseRevision(raw: string | null): number | undefined {
 function decodePath(raw: string): string {
   const decoded = decodeURIComponent(raw);
   return decoded === "" ? "/" : decoded;
-}
-
-function cookie(request: IncomingMessage, name: string): string | null {
-  const source = request.headers.cookie;
-
-  if (!source) {
-    return null;
-  }
-
-  for (const fragment of source.split(";")) {
-    const [key, ...value] = fragment.trim().split("=");
-
-    if (key === name) {
-      try {
-        return decodeURIComponent(value.join("="));
-      } catch {
-        return null;
-      }
-    }
-  }
-
-  return null;
 }
 
 function html(response: ServerResponse, status: number, body: string): void {

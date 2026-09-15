@@ -15,6 +15,7 @@ import {
   ProposalSummarySchema,
   ProposalIdSchema,
   PwdStateSchema,
+  QueryLinkResultSchema,
   RevisionListResultSchema,
   RevisionSchema,
   RevisionShowResultSchema,
@@ -83,12 +84,20 @@ export const OperationSchemas = {
     output: SearchResultSchema,
   },
   "rev-list": {
-    input: PathInputSchema.extend({ reference: RevisionSchema.optional() }).strict(),
+    input: PathInputSchema.extend({ reference: RevisionSchema.optional(), verbose: z.boolean() }).strict(),
     output: RevisionListResultSchema,
+  },
+  "query-link": {
+    input: PathInputSchema.extend({
+      direction: z.enum(["parent", "child"]),
+      revision: RevisionSchema.optional(),
+      reference: RevisionSchema.optional(),
+    }).strict(),
+    output: QueryLinkResultSchema,
   },
   "rev-show": {
     input: PathInputSchema.extend({
-      revision: RevisionSchema,
+      revision: RevisionSchema.optional(),
       reference: RevisionSchema.optional(),
     }).strict(),
     output: RevisionShowResultSchema,

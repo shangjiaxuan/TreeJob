@@ -3,7 +3,7 @@ import {
   RepositoryError,
   type EffectiveLink,
   type Id,
-  type Link,
+  type LinkRecord,
   type NodeRecord,
   type Proposal,
   type RecordRepository,
@@ -37,43 +37,51 @@ export type ResolvedSession = {
 export type StateMutation = {
   changed: boolean;
   cursorLinkPath: Id[];
+  nodeRecords: NodeRecord[];
+  linkRecords: Array<{ record: LinkRecord; previousParentNodeId: Id | null }>;
 };
 
 export type InitializedSession = {
   rootNodeId: Id;
   cursorLinkPath: Id[];
+  nodeRecords: NodeRecord[];
+};
+
+export type LinkHistoryQuery = {
+  view: SessionRevision;
+  node: ResolvedNode;
+  links: Array<{ name: string; records: LinkRecord[] }>;
 };
 
 export type ProposalMutation =
   | { kind: "unchanged"; cursorLinkPath: Id[]; status: "rejected" | "discarded" }
-  | { kind: "state"; cursorLinkPath: Id[]; status: "applied" };
+  | { kind: "state"; cursorLinkPath: Id[]; status: "applied"; nodeRecords: NodeRecord[] };
 
 type PathSegment = { value: string; escaped: boolean };
 type LinkLocation = { parentNodeId: Id; name: string };
 
 /**
- * v7 evaluates work and topology independently in an explicit session view.
- * Node records hold work; link records hold names and placement.
+ * v8 creates physical records first. The controller alone publishes their
+ * references into the session revision selected by this mutation.
  */
 export class ContinuationModel {
   constructor(private readonly records: RecordRepository) {}
 
   createSession(sessionId: string, cwd: string): InitializedSession {
     const createdAt = this.timestamp();
-    const rootNodeId = this.records.createNode(sessionId, 0);
-    this.records.insertNodeRecord(rootNodeId, sessionId, 0, this.emptyWork());
+    const rootNodeId = this.records.createNode();
+    const rootRecord = this.records.insertNodeRecord(rootNodeId, this.emptyWork());
     this.records.insertSession({
       id: sessionId,
       workspacePath: resolveFilesystemPath(cwd),
       rootNodeId,
-      headRevision: 0,
+      headRevision: -1,
+      headRevisionCreatedAt: createdAt,
       cursorLinkPath: [],
-      parentSessionId: null,
-      parentSessionRevision: null,
       createdAt,
       updatedAt: createdAt,
     });
-    return { rootNodeId, cursorLinkPath: [] };
+    return { rootNodeId, cursorLinkPath: [], nodeRecords: [rootRecord] };
   }
 
   validateWorkspace(session: Session, cwd: string): void {
@@ -83,8 +91,7 @@ export class ContinuationModel {
   }
 
   resolveSession(sessionId: string): ResolvedSession {
-    const session = this.records.getSession(sessionId);
-    const view = this.records.getSessionRevision(sessionId, session.headRevision);
+    const { session, view } = this.records.getHeadSessionView(sessionId);
     const root = this.root(view);
     const nodes = [root];
     let current = root;
@@ -117,35 +124,34 @@ export class ContinuationModel {
     return { selected, node };
   }
 
-  mkdir(resolved: ResolvedSession, revision: number, name: string, patch: WorkPatch): StateMutation {
+  mkdir(resolved: ResolvedSession, name: string, patch: WorkPatch): StateMutation {
     const parent = this.current(resolved);
     const normalizedName = this.normalizeName(name);
     this.ensureNameAvailable(this.entries(resolved.view, parent), normalizedName);
-    const childNodeId = this.records.createNode(resolved.session.id, revision);
-    const link = this.records.createLink(childNodeId, resolved.session.id, revision);
-    this.records.insertNodeRecord(childNodeId, resolved.session.id, revision, this.mergeWork(this.emptyWork(), patch));
-    this.records.insertLinkRecord(link.id, resolved.session.id, revision, parent.nodeId, normalizedName);
-    return { changed: true, cursorLinkPath: resolved.session.cursorLinkPath };
+    const childNodeId = this.records.createNode();
+    const link = this.records.createLink(childNodeId);
+    const childRecord = this.records.insertNodeRecord(childNodeId, this.mergeWork(this.emptyWork(), patch));
+    const linkRecord = this.records.insertLinkRecord(link.id, parent.nodeId, normalizedName);
+    return {
+      changed: true,
+      cursorLinkPath: resolved.session.cursorLinkPath,
+      nodeRecords: [childRecord],
+      linkRecords: [{ record: linkRecord, previousParentNodeId: null }],
+    };
   }
 
-  edit(resolved: ResolvedSession, revision: number, patch: WorkPatch): StateMutation {
+  edit(resolved: ResolvedSession, patch: WorkPatch): StateMutation {
     const current = this.current(resolved);
-    this.records.insertNodeRecord(
-      current.nodeId,
-      resolved.session.id,
-      revision,
-      this.mergeWork(current.record.attributes, patch),
-    );
-    return { changed: true, cursorLinkPath: resolved.session.cursorLinkPath };
+    const record = this.records.insertNodeRecord(current.nodeId, this.mergeWork(current.record.attributes, patch));
+    return { changed: true, cursorLinkPath: resolved.session.cursorLinkPath, nodeRecords: [record], linkRecords: [] };
   }
 
   cd(resolved: ResolvedSession, path: string): StateMutation {
-    return { changed: false, cursorLinkPath: this.resolvePath(resolved, path).linkPath };
+    return { changed: false, cursorLinkPath: this.resolvePath(resolved, path).linkPath, nodeRecords: [], linkRecords: [] };
   }
 
   close(
     resolved: ResolvedSession,
-    revision: number,
     summary: string,
     status: "done" | "abandoned" | "superseded",
   ): StateMutation {
@@ -153,19 +159,19 @@ export class ContinuationModel {
     if (this.hasOpenDescendant(resolved.view, current, new Set([current.nodeId]))) {
       throw new RepositoryError("invariant", "cannot close a node with open descendants");
     }
-    this.records.insertNodeRecord(
+    const record = this.records.insertNodeRecord(
       current.nodeId,
-      resolved.session.id,
-      revision,
       this.mergeWork(current.record.attributes, { status, currentState: summary }),
     );
     return {
       changed: true,
       cursorLinkPath: current.linkPath.length === 0 ? current.linkPath : current.linkPath.slice(0, -1),
+      nodeRecords: [record],
+      linkRecords: [],
     };
   }
 
-  move(resolved: ResolvedSession, revision: number, sourcePath: string, destinationPath: string): StateMutation {
+  move(resolved: ResolvedSession, sourcePath: string, destinationPath: string): StateMutation {
     const source = this.resolvePath(resolved, sourcePath);
     if (source.linkId === null || source.linkPath.length === 0) {
       throw new RepositoryError("invariant", "cannot move the root node");
@@ -176,13 +182,7 @@ export class ContinuationModel {
       throw new RepositoryError("invariant", "cannot move a node into its descendant");
     }
     this.ensureMoveName(resolved.view, destination.parent, source.linkId, destination.name);
-    this.records.insertLinkRecord(
-      source.linkId,
-      resolved.session.id,
-      revision,
-      destination.parent.nodeId,
-      destination.name,
-    );
+    const record = this.records.insertLinkRecord(source.linkId, destination.parent.nodeId, destination.name);
     return {
       changed: true,
       cursorLinkPath: this.repairMovedCursor(
@@ -190,29 +190,31 @@ export class ContinuationModel {
         source.linkPath,
         [...destination.parent.linkPath, source.linkId],
       ),
+      nodeRecords: [],
+      linkRecords: [{ record, previousParentNodeId: sourceLink.parentNodeId }],
     };
   }
 
   fork(resolved: ResolvedSession, newSessionId: string): InitializedSession {
     const existing = this.records.findSession(newSessionId);
     if (existing !== null) {
-      return { rootNodeId: existing.rootNodeId, cursorLinkPath: existing.cursorLinkPath };
+      return { rootNodeId: existing.rootNodeId, cursorLinkPath: existing.cursorLinkPath, nodeRecords: [] };
     }
     const createdAt = this.timestamp();
     this.records.insertSession({
       id: newSessionId,
       workspacePath: resolved.session.workspacePath,
       rootNodeId: resolved.view.rootNodeId,
-      headRevision: 0,
+      headRevision: -1,
+      headRevisionCreatedAt: createdAt,
       cursorLinkPath: resolved.session.cursorLinkPath,
-      parentSessionId: resolved.session.id,
-      parentSessionRevision: resolved.view.revision,
       createdAt,
       updatedAt: createdAt,
     });
     return {
       rootNodeId: resolved.view.rootNodeId,
       cursorLinkPath: resolved.session.cursorLinkPath,
+      nodeRecords: [],
     };
   }
 
@@ -239,7 +241,6 @@ export class ContinuationModel {
 
   decideProposal(
     resolved: ResolvedSession,
-    revision: number,
     proposal: Proposal,
     decision: ProposalDecision,
     replacement: WorkPatch | null,
@@ -253,13 +254,8 @@ export class ContinuationModel {
     }
     const patch = decision === "accept" ? proposal.patch : replacement;
     if (patch === null) throw new RepositoryError("invariant", "proposal decision requires a patch");
-    this.records.insertNodeRecord(
-      proposal.targetNodeId,
-      resolved.session.id,
-      revision,
-      this.mergeWork(current.attributes, patch),
-    );
-    return { kind: "state", cursorLinkPath: resolved.session.cursorLinkPath, status: "applied" };
+    const record = this.records.insertNodeRecord(proposal.targetNodeId, this.mergeWork(current.attributes, patch));
+    return { kind: "state", cursorLinkPath: resolved.session.cursorLinkPath, status: "applied", nodeRecords: [record] };
   }
 
   allNodes(resolved: ResolvedSession): ResolvedNode[] {
@@ -287,20 +283,58 @@ export class ContinuationModel {
     sessionId: string,
     referenceRevision: number | undefined,
     rawPath: string,
-  ): Array<{ revision: SessionRevision; node: ResolvedNode; changes: Array<"work" | "children" | "renamed" | "moved"> }> {
+    includeCreatedView = false,
+  ): Array<{
+    revision: SessionRevision;
+    changes: Array<"work" | "children" | "renamed" | "moved">;
+    createdView?: { sessionId: string; revision: number };
+  }> {
     const session = this.records.getSession(sessionId);
     const reference = this.referenceNode(session, referenceRevision, rawPath);
     let previous: { view: SessionRevision; node: ResolvedNode; location: LinkLocation | null } | null = null;
-    const output: Array<{ revision: SessionRevision; node: ResolvedNode; changes: Array<"work" | "children" | "renamed" | "moved"> }> = [];
+    const output: Array<{
+      revision: SessionRevision;
+      changes: Array<"work" | "children" | "renamed" | "moved">;
+      createdView?: { sessionId: string; revision: number };
+    }> = [];
     for (const view of this.records.listSessionRevisions(sessionId)) {
       const node = this.findNode(view, reference.nodeId);
       if (node === null) continue;
       const location = reference.linkId === null ? null : this.linkLocation(view, reference.linkId);
       const changes = this.semanticChanges(view, previous, { node, location });
-      if (changes.length > 0) output.push({ revision: view, node, changes });
+      const entry = { revision: view, changes };
+      output.push(includeCreatedView
+        ? { ...entry, createdView: { sessionId: node.record.sessionId, revision: node.record.revision } }
+        : entry);
       previous = { view, node, location };
     }
     return output;
+  }
+
+  linkHistory(
+    sessionId: string,
+    direction: "parent" | "child",
+    revision: number | undefined,
+    referenceRevision: number | undefined,
+    rawPath: string,
+  ): LinkHistoryQuery {
+    const live = this.resolveSession(sessionId);
+    let selected: SessionRevision;
+    let node: ResolvedNode;
+
+    if (revision === undefined) {
+      selected = live.view;
+      node = this.resolvePath(live, rawPath);
+    } else {
+      const historical = this.resolveView(sessionId, revision, referenceRevision, rawPath);
+      selected = historical.selected;
+      node = historical.node;
+    }
+
+    const links = direction === "parent"
+      ? this.parentLinkHistory(selected, node)
+      : this.childLinkHistory(selected, node);
+    return { view: selected, node, links };
   }
 
   work(node: ResolvedNode): WorkFields {
@@ -326,6 +360,19 @@ export class ContinuationModel {
 
   private root(view: View): ResolvedNode {
     return this.resolveNode(view, view.rootNodeId, [], [], null);
+  }
+
+  private parentLinkHistory(view: View, node: ResolvedNode): Array<{ name: string; records: LinkRecord[] }> {
+    if (node.linkId === null) return [];
+    const link = this.records.resolveLinkRecord(node.linkId, view);
+    return [{ name: link.name, records: this.records.listVisibleLinkRecords(node.linkId, view) }];
+  }
+
+  private childLinkHistory(view: View, node: ResolvedNode): Array<{ name: string; records: LinkRecord[] }> {
+    return this.entries(view, node).map(({ name, child }) => {
+      if (child.linkId === null) throw new RepositoryError("invariant", "child is missing a directory link");
+      return { name, records: this.records.listVisibleLinkRecords(child.linkId, view) };
+    });
   }
 
   private resolveNode(view: View, nodeId: Id, linkPath: Id[], names: string[], linkId: Id | null): ResolvedNode {

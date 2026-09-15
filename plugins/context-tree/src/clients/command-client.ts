@@ -5,6 +5,16 @@ import { openMcpConnection } from "./transport.js";
 
 export class McpCommandError extends Error {}
 
+const queryCommands = new Set([
+  "ls",
+  "search",
+  "rev-list",
+  "rev-show",
+  "query-link",
+  "briefing",
+  "proposals",
+]);
+
 export async function callCommand(
   raw: CommandInput,
   timeout = 8_000,
@@ -22,6 +32,19 @@ export async function callCommand(
 
     return await invoke(input, timeout, key);
   }
+}
+
+export async function callQuery(
+  raw: CommandInput,
+  timeout = 8_000,
+): Promise<unknown> {
+  const commandName = raw.command[0];
+
+  if (typeof commandName !== "string" || !queryCommands.has(commandName)) {
+    throw new McpCommandError("Context Tree query client rejects mutating command: " + String(commandName));
+  }
+
+  return callCommand(raw, timeout);
 }
 
 async function invoke(input: CommandInput, timeout: number, key: string | undefined): Promise<unknown> {

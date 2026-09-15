@@ -1,10 +1,11 @@
 # Context Tree
 
-Context Tree is a local persistent continuation notebook for Codex. Its v7
-storage model separates logical node work from directory topology: nodes are
-inode-like continuation identities, while stable links own historical names and
-placements. Public history is a per-session timeline (`r0`, `r1`, ...), where
-each revision is a frozen `{session, revision}` view.
+Context Tree is a local persistent continuation notebook for Codex. Its v8
+storage model separates stable inode and link identities from the lightweight
+physical records that materialize their work and topology. A public
+per-session timeline (`r0`, `r1`, ...) publishes those physical record IDs.
+Each revision is a frozen `{session, revision}` view; it is not an event-log
+replay.
 
 Source checkouts contain only authored files. Build the ignored staged
 marketplace artifact before installing it in Codex; the artifact bundles its
@@ -78,13 +79,21 @@ Unicode NFC and case-sensitive. `mv` retains stable node and directory-link
 identity for a same-name move or a rename. Record and snapshot IDs are internal
 implementation details.
 
-Every state mutation creates one lightweight session revision, while `cd`
-changes only the cursor. Node work updates append node history; `mkdir`, moves,
-and renames append link history. A selected revision resolves both histories
-as-of that fixed view, so a child work update is visible through every active
-link without rewriting parent directories. `rev-list [path] [--reference=N]`
-reports semantic work, child, rename, and move history.
-`rev-show <revision> [path] [--reference=N]` resolves the path identity at the
+Every state mutation first writes unreachable physical payload, node, or link
+records, then reserves its next session revision and publishes only its changed
+record IDs. `cd` changes only the cursor. A sparse session-span table freezes
+fork ancestry, so resolution makes bounded indexed probes: it seeks a visible
+published inode or link record in the applicable span and only then follows the
+frozen source span. Events are diagnostics, never state. A child work update
+therefore publishes one node reference without rewriting its parents; a rename
+or move publishes link references without rewriting the child work.
+
+`rev-list [path] [--reference=N]` reports semantic work, child, rename, and
+move history. Add `--verbose` to include the originating `{ sessionId,
+revision }` view for each node state. `query-link <parent|child> [path]`
+inspects a node's stable directory-link history and likewise returns its
+creating views. These are distinct from the session revision timeline.
+`rev-show [revision] [path] [--reference=N]` resolves the path identity at the
 reference revision (the head by default) and renders it at the selected
 revision. `ls` also accepts `--revision=N --reference=N` for historical
 directory inspection. Session revisions are public; SQLite node, link, and
@@ -106,12 +115,13 @@ port:
     npm run browse -- --data-dir C:/temp/context-tree-trial --port 48731
 
 It listens only on `127.0.0.1` and prints its address. The landing page asks
-for an existing Context Tree session ID, stores it in a local `HttpOnly`,
-`SameSite=Strict` cookie, and redirects to `/browse/`. Browse a node directly
-with `http://127.0.0.1:<port>/browse/<path>`; add `?revision=<id>` to inspect a
-historical session revision. Add `?reference=<id>` when the URL path should be
-resolved against a historical state rather than the session head. The page is
-read-only and queries the daemon through MCP instead of opening SQLite.
+for an existing Context Tree session ID and opens
+`/browse/<path>?sessionId=<id>`. The browser stores no session cookie: omitting
+`revision` and `reference` always refreshes the latest database head, while
+adding `?revision=<id>` inspects a historical session revision. Add
+`?reference=<id>` when the URL path should be resolved against a historical
+state rather than the session head. The page is read-only and composes public
+MCP query commands instead of opening SQLite.
 
 ## Staged marketplace artifact
 

@@ -1,6 +1,6 @@
 {
   "name": "context-tree",
-  "version": "0.8.0+codex.20260914171345",
+  "version": "0.9.0+codex.20260915001317",
   "description": "Persistent filesystem-style continuation state for Codex sessions.",
   "author": {
     "name": "TreeContext"

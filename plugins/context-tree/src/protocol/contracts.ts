@@ -38,6 +38,12 @@ export type SearchScope = "subtree" | "session" | "workspace" | "global" | "hist
 export type RevisionChange = "work" | "children" | "renamed" | "moved";
 
 /** @schema @strict */
+export interface SessionViewIdentity {
+  sessionId: string;
+  revision: Revision;
+}
+
+/** @schema @strict */
 export interface Reference {
   /** @minLength 1 */
   label: string;
@@ -139,6 +145,28 @@ export interface RevisionSummary {
   revision: Revision;
   createdAt: Timestamp;
   changes: RevisionChange[];
+  created_view?: SessionViewIdentity;
+}
+
+/** @schema @strict */
+export interface LinkRevision {
+  created_view: SessionViewIdentity;
+  name: string;
+  createdAt: Timestamp;
+}
+
+/** @schema @strict */
+export interface LinkHistory {
+  name: string;
+  revisions: LinkRevision[];
+}
+
+/** @schema @strict */
+export interface QueryLinkResult extends CursorState {
+  view: SessionViewIdentity;
+  node_path: string;
+  direction: "parent" | "child";
+  links: LinkHistory[];
 }
 
 /** @schema @strict */

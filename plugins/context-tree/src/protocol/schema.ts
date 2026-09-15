@@ -29,6 +29,7 @@ import type {
   ProposalListResult,
   ProposalSummary,
   PwdState,
+  QueryLinkResult,
   RecordStatus,
   Reference,
   Revision,
@@ -65,6 +66,7 @@ export const ReferenceSchema = typedSchema<Reference>("Reference");
 export const WorkFieldsSchema = typedSchema<WorkFields>("WorkFields");
 export const WorkPatchSchema = typedSchema<WorkPatch>("WorkPatch");
 export const PwdStateSchema = typedSchema<PwdState>("PwdState");
+export const QueryLinkResultSchema = typedSchema<QueryLinkResult>("QueryLinkResult");
 export const CursorStateSchema = typedSchema<CursorState>("CursorState");
 export const CdResultSchema = typedSchema<CdResult>("CdResult");
 export const MkdirResultSchema = typedSchema<MkdirResult>("MkdirResult");
@@ -115,6 +117,7 @@ export type {
   ProposalListResult,
   ProposalSummary,
   PwdState,
+  QueryLinkResult,
   RecordStatus,
   Reference,
   Revision,
