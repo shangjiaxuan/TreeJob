@@ -68,6 +68,21 @@ test("pwd is detailed while mutations return compact affected-state acknowledgem
   }
 });
 
+test("ls briefing stays direct while cd returns the full active ancestry", () => {
+  const context = createContext();
+  try {
+    command(context.controller, "session", ["pwd", "C:/work"]);
+    command(context.controller, "session", ["mkdir", "child", { objective: "Child", returnCondition: "finish" }]);
+    const listed = command(context.controller, "session", ["ls", "-a"]);
+    assert.equal(listed.childBriefings.length, 1);
+    assert.equal(listed.childBriefings[0].path, "/child");
+    const moved = command(context.controller, "session", ["cd", "child"]);
+    assert.deepEqual(moved.briefing.map((entry: { path: string }) => entry.path), ["/", "/child"]);
+  } finally {
+    context.cleanup();
+  }
+});
+
 test("published references own revisions while events remain diagnostic", () => {
   const context = createContext();
   let database: DatabaseSync | undefined;
@@ -78,17 +93,17 @@ test("published references own revisions while events remain diagnostic", () => 
     const head = context.repository.getHeadSessionView("session");
     database = new DatabaseSync(join(context.directory, "context-tree.sqlite"));
     const revisions = database.prepare(
-      "SELECT revision FROM session_revisions_v8 WHERE session_id=? ORDER BY revision",
-    ).all("session") as Array<{ revision: number }>;
+      "SELECT revision FROM branch_revisions_v9 WHERE branch_id=? ORDER BY revision",
+    ).all(head.session.branchId) as Array<{ revision: number }>;
     const reference = database.prepare(
-      "SELECT record_id FROM published_node_refs_v8 WHERE session_id=? AND inode_id=? AND revision=?",
-    ).get("session", head.view.rootNodeId, 1) as { record_id: number } | undefined;
+      "SELECT record_id FROM published_node_refs_v9 WHERE branch_id=? AND inode_id=? AND revision=?",
+    ).get(head.session.branchId, head.view.rootNodeId, 1) as { record_id: number } | undefined;
     const event = database.prepare(
-      "SELECT revision,event_json FROM session_events_v8 WHERE session_id=? AND revision=?",
+      "SELECT revision,event_json FROM session_events_v9 WHERE session_id=? AND revision=?",
     ).get("session", 1) as { revision: number; event_json: string } | undefined;
     const plan = database.prepare(
-      "EXPLAIN QUERY PLAN SELECT record_id FROM published_node_refs_v8 WHERE session_id=? AND inode_id=? AND revision>=? AND revision<=? ORDER BY revision DESC LIMIT 1",
-    ).all("session", head.view.rootNodeId, 0, 1) as Array<{ detail: string }>;
+      "EXPLAIN QUERY PLAN SELECT record_id FROM published_node_refs_v9 WHERE branch_id=? AND inode_id=? AND revision>=? AND revision<=? ORDER BY revision DESC LIMIT 1",
+    ).all(head.session.branchId, head.view.rootNodeId, 0, 1) as Array<{ detail: string }>;
     assert.deepEqual(revisions.map((row) => row.revision), [0, 1]);
     assert.equal(typeof reference?.record_id, "number");
     assert.equal(event?.revision, 1);
@@ -126,14 +141,14 @@ test("payload edits and topology edits publish independent record streams", () =
     assert.equal(childNode.current_work.currentState, "changed");
 
     database = new DatabaseSync(join(context.directory, "context-tree.sqlite"));
-    const nodeColumns = database.prepare("PRAGMA table_info(node_records_v8)").all() as Array<{ name: string }>;
+    const nodeColumns = database.prepare("PRAGMA table_info(node_records_v9)").all() as Array<{ name: string }>;
     const plans = [
       database.prepare(
-        "EXPLAIN QUERY PLAN SELECT * FROM session_spans_v8 WHERE session_id=? AND first_revision<=? ORDER BY first_revision DESC LIMIT 1",
-      ).all("session", 2),
+        "EXPLAIN QUERY PLAN SELECT * FROM branch_spans_v9 WHERE branch_id=? AND first_revision<=? ORDER BY first_revision DESC LIMIT 1",
+      ).all(context.repository.getSession("session").branchId, 2),
       database.prepare(
-        "EXPLAIN QUERY PLAN SELECT link_id,record_id,revision FROM published_link_refs_v8 WHERE session_id=? AND parent_inode_id=? AND revision>=? AND revision<=? ORDER BY revision DESC",
-      ).all("session", root.rootNodeId, 0, 2),
+        "EXPLAIN QUERY PLAN SELECT link_id,record_id,revision FROM published_link_refs_v9 WHERE branch_id=? AND parent_inode_id=? AND revision>=? AND revision<=? ORDER BY revision DESC",
+      ).all(context.repository.getSession("session").branchId, root.rootNodeId, 0, 2),
     ] as Array<Array<{ detail: string }>>;
 
     assert.ok(!nodeColumns.some((column) => column.name === "work_json"));
@@ -190,15 +205,15 @@ test("verbose revision and link queries expose their concrete creating views", (
         createdView: revision.created_view,
       })),
       [
-        { revision: 1, createdView: { sessionId: "session", revision: 1 } },
-        { revision: 2, createdView: { sessionId: "session", revision: 1 } },
+        { revision: 1, createdView: { sessionId: "1", revision: 1 } },
+        { revision: 2, createdView: { sessionId: "1", revision: 1 } },
       ],
     );
     assert.deepEqual(links.links, [{
       name: "renamed",
       revisions: [
-        { created_view: { sessionId: "session", revision: 1 }, name: "test", createdAt: links.links[0].revisions[0].createdAt },
-        { created_view: { sessionId: "session", revision: 2 }, name: "renamed", createdAt: links.links[0].revisions[1].createdAt },
+        { created_view: { sessionId: "1", revision: 1 }, name: "test", createdAt: links.links[0].revisions[0].createdAt },
+        { created_view: { sessionId: "1", revision: 2 }, name: "renamed", createdAt: links.links[0].revisions[1].createdAt },
       ],
     }]);
   } finally {
@@ -281,7 +296,7 @@ test("daemon ownership and startup are exclusive across data directories", () =>
     assert.equal(first.acquire(), true);
     assert.equal(second.acquire(), false);
     first.close();
-    writeFileSync(join(runtime, "daemon-v8.json"), JSON.stringify({
+    writeFileSync(join(runtime, "daemon-v9.json"), JSON.stringify({
       endpoint: "http://127.0.0.1:45124/mcp",
       pid: 999_999,
       dataDirectoryFingerprint: "stale",
@@ -412,14 +427,59 @@ test("idempotent replay does not advance a second revision and validates workspa
   }
 });
 
-test("forks retain a frozen view after the parent changes", () => {
+test("sessions share mainline state while private overlays remain local", () => {
   const context = createContext();
   try {
     command(context.controller, "parent", ["pwd", "C:/work"]);
-    command(context.controller, "parent", ["edit", { currentState: "before fork" }]);
-    command(context.controller, "parent", ["fork", "child"]);
-    command(context.controller, "parent", ["edit", { currentState: "after fork" }]);
-    assert.equal(command(context.controller, "child", ["pwd"]).current_work.currentState, "before fork");
+    command(context.controller, "parent", ["edit", { currentState: "shared" }]);
+    command(context.controller, "child", ["pwd", "C:/work"]);
+    assert.equal(command(context.controller, "child", ["pwd"]).current_work.currentState, "shared");
+    command(context.controller, "child", ["edit", { currentState: "draft" }]);
+    assert.equal(command(context.controller, "child", ["pwd"]).current_work.currentState, "draft");
+    assert.equal(command(context.controller, "parent", ["pwd"]).current_work.currentState, "shared");
+  } finally {
+    context.cleanup();
+  }
+});
+
+test("published overlays become owner mailbox candidates and accept atomically updates main", () => {
+  const context = createContext();
+  try {
+    command(context.controller, "owner-session", ["set-identity", "owner"]);
+    command(context.controller, "owner-session", ["pwd", "C:/work"]);
+    command(context.controller, "owner-session", ["edit", { currentState: "authoritative" }]);
+    command(context.controller, "author-session", ["set-identity", "author"]);
+    command(context.controller, "author-session", ["pwd", "C:/work"]);
+    command(context.controller, "author-session", ["edit", { currentState: "candidate" }]);
+    command(context.controller, "author-session", ["publish"]);
+
+    const inbox = command(context.controller, "owner-session", ["proposals", "--scope=inbox"]);
+    assert.equal(inbox.mailbox.length, 1);
+    assert.equal(inbox.mailbox[0].candidateWork.currentState, "candidate");
+    const accepted = command(context.controller, "owner-session", [
+      "decide-proposal", "mailbox", ".", "author-session", "accept",
+    ]);
+    assert.equal(accepted.status, "applied");
+    assert.equal(command(context.controller, "owner-session", ["pwd"]).current_work.currentState, "candidate");
+    assert.equal(command(context.controller, "author-session", ["pwd"]).current_work.currentState, "candidate");
+  } finally {
+    context.cleanup();
+  }
+});
+
+test("a group topology dropbox permits shared child creation without granting child content ownership", () => {
+  const context = createContext();
+  try {
+    command(context.controller, "owner-session", ["set-identity", "owner", ["team"]]);
+    command(context.controller, "owner-session", ["pwd", "C:/work"]);
+    command(context.controller, "owner-session", ["chmod", "744", "776", ".", "--group", "team"]);
+    command(context.controller, "member-session", ["set-identity", "member", ["team"]]);
+    command(context.controller, "member-session", ["pwd", "C:/work"]);
+    command(context.controller, "member-session", ["mkdir", "drop", { returnCondition: "finish" }]);
+    command(context.controller, "owner-session", ["cd", "drop"]);
+    command(context.controller, "owner-session", ["edit", { currentState: "owner draft" }]);
+    assert.equal(command(context.controller, "member-session", ["cd", "drop"]).briefing.at(-1)?.work.currentState, "");
+    assert.equal(command(context.controller, "owner-session", ["pwd"]).current_work.currentState, "owner draft");
   } finally {
     context.cleanup();
   }

@@ -10,6 +10,7 @@ import { tokenize } from "./shell-lexer.js";
 type ShellOptions = {
   dataDir: string;
   sessionId: string | null;
+  branch: string | null;
   cleanupDataDir: boolean;
 };
 
@@ -61,6 +62,7 @@ async function execute(line: string): Promise<boolean> {
   const isHelp = command[0] === "help";
   const result = await callCommand({
     ...(isHelp ? {} : { sessionId: defaultSessionId }),
+    ...(isHelp || options.branch === null ? {} : { branch: options.branch }),
     command,
   });
 
@@ -106,9 +108,10 @@ function parseOptions(args: string[]): ShellOptions {
 
   const requestedDataDir = values.get("--data-dir");
   const requestedSessionId = values.get("--session-id");
+  const requestedBranch = values.get("--branch");
 
   for (const name of values.keys()) {
-    if (name !== "--data-dir" && name !== "--session-id") {
+    if (name !== "--data-dir" && name !== "--session-id" && name !== "--branch") {
       throw new Error("unknown argument: " + name);
     }
   }
@@ -122,6 +125,7 @@ function parseOptions(args: string[]): ShellOptions {
       join(tmpdir(), "context-tree-shell-"),
     ),
     sessionId: requestedSessionId ?? null,
+    branch: requestedBranch ?? null,
     cleanupDataDir: !requestedDataDir,
   };
 }
@@ -139,7 +143,7 @@ async function cleanupTemporaryDataDir(directory: string): Promise<void> {
 function printUsageAndExit(): never {
   stdout.write(
     "Usage: context-tree-shell " +
-      "[--data-dir <directory> | --ephemeral] [--session-id <id>]\n",
+      "[--data-dir <directory> | --ephemeral] [--session-id <id>] [--branch <name>]\n",
   );
   process.exit(0);
 }

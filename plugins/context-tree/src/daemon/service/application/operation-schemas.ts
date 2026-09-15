@@ -4,6 +4,11 @@ import {
   CdResultSchema,
   CloseResultSchema,
   EditResultSchema,
+  IdentityResultSchema,
+  JsonSchema,
+  MailboxResultSchema,
+  MailboxDecisionResultSchema,
+  AccessResultSchema,
   ForkResultSchema,
   ListResultSchema,
   MkdirResultSchema,
@@ -26,6 +31,7 @@ import {
 
 const SessionInputSchema = z.object({
   sessionId: z.string().min(1),
+  branch: z.string().min(1).optional(),
 }).strict();
 
 const PathInputSchema = SessionInputSchema.extend({
@@ -43,6 +49,7 @@ export const OperationSchemas = {
     input: PathInputSchema.extend({
       revision: RevisionSchema.optional(),
       reference: RevisionSchema.optional(),
+      briefing: z.boolean().optional(),
     }).strict(),
     output: ListResultSchema,
   },
@@ -54,17 +61,19 @@ export const OperationSchemas = {
     input: SessionInputSchema.extend({
       name: z.string().min(1),
       work: WorkPatchSchema.optional(),
+      local: z.boolean().optional(),
     }).strict(),
     output: MkdirResultSchema,
   },
   edit: {
-    input: SessionInputSchema.extend({ patch: WorkPatchSchema }).strict(),
+    input: SessionInputSchema.extend({ patch: WorkPatchSchema, local: z.boolean().optional() }).strict(),
     output: EditResultSchema,
   },
   mv: {
     input: SessionInputSchema.extend({
       source: z.string().min(1),
       destination: z.string().min(1),
+      local: z.boolean().optional(),
     }).strict(),
     output: MoveResultSchema,
   },
@@ -72,6 +81,7 @@ export const OperationSchemas = {
     input: SessionInputSchema.extend({
       status: TerminalStatusSchema,
       summary: z.string().min(1),
+      local: z.boolean().optional(),
     }).strict(),
     output: CloseResultSchema,
   },
@@ -111,8 +121,32 @@ export const OperationSchemas = {
     output: BriefingResultSchema,
   },
   proposals: {
-    input: SessionInputSchema,
+    input: SessionInputSchema.extend({ scope: z.enum(["local", "inbox"]).optional() }).strict(),
     output: ProposalListResultSchema,
+  },
+  "set-identity": {
+    input: SessionInputSchema.extend({
+      userId: z.string().min(1),
+      groups: z.array(z.string()).optional(),
+      metadata: z.record(z.string(), JsonSchema).optional(),
+    }).strict(),
+    output: IdentityResultSchema,
+  },
+  publish: {
+    input: PathInputSchema,
+    output: MailboxResultSchema,
+  },
+  withdraw: {
+    input: PathInputSchema,
+    output: MailboxResultSchema,
+  },
+  chmod: {
+    input: PathInputSchema.extend({
+      contentAccess: z.number().int().min(0).max(0o777),
+      topologyAccess: z.number().int().min(0).max(0o777),
+      groupId: z.string().min(1).nullable().optional(),
+    }).strict(),
+    output: AccessResultSchema,
   },
   "decide-proposal": {
     input: SessionInputSchema.extend({
@@ -121,6 +155,15 @@ export const OperationSchemas = {
       replacement: WorkPatchSchema.optional(),
     }).strict(),
     output: ProposalDecisionResultSchema,
+  },
+  "decide-mailbox": {
+    input: SessionInputSchema.extend({
+      path: z.string().min(1),
+      authorSessionId: z.string().min(1),
+      decision: z.enum(["accept", "replace", "reject"]),
+      replacement: WorkPatchSchema.optional(),
+    }).strict(),
+    output: MailboxDecisionResultSchema,
   },
   "submit-proposal": {
     input: SessionInputSchema.extend({

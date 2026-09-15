@@ -46,6 +46,6 @@ export type ContractSpec = ContractConstraint & (
 );
 
 export type ContractMetadata = {
-  version: 4;
+  version: 5;
   schemas: Record<string, ContractSpec>;
 };

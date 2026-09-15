@@ -41,7 +41,7 @@ for (const [name, declaration] of declarations) {
 }
 
 const metadata = {
-  version: 4,
+  version: 5,
   schemas,
 };
 

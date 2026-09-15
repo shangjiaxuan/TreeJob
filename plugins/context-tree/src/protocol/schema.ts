@@ -20,6 +20,11 @@ import type {
   ListResult,
   MkdirResult,
   MoveResult,
+  MailboxCandidate,
+  MailboxResult,
+  MailboxDecisionResult,
+  IdentityResult,
+  AccessResult,
   MovedNode,
   RevisionSummary,
   ProposalDecision,
@@ -72,6 +77,10 @@ export const CdResultSchema = typedSchema<CdResult>("CdResult");
 export const MkdirResultSchema = typedSchema<MkdirResult>("MkdirResult");
 export const EditResultSchema = typedSchema<EditResult>("EditResult");
 export const MoveResultSchema = typedSchema<MoveResult>("MoveResult");
+export const MailboxResultSchema = typedSchema<MailboxResult>("MailboxResult");
+export const MailboxDecisionResultSchema = typedSchema<MailboxDecisionResult>("MailboxDecisionResult");
+export const IdentityResultSchema = typedSchema<IdentityResult>("IdentityResult");
+export const AccessResultSchema = typedSchema<AccessResult>("AccessResult");
 export const CloseResultSchema = typedSchema<CloseResult>("CloseResult");
 export const ForkResultSchema = typedSchema<ForkResult>("ForkResult");
 export const BriefingResultSchema = typedSchema<BriefingResult>("BriefingResult");
@@ -108,6 +117,11 @@ export type {
   ListResult,
   MkdirResult,
   MoveResult,
+  MailboxCandidate,
+  MailboxResult,
+  MailboxDecisionResult,
+  IdentityResult,
+  AccessResult,
   MovedNode,
   RevisionSummary,
   ProposalDecision,

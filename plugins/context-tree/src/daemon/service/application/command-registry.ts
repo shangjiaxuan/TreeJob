@@ -1,3 +1,4 @@
+import { z } from "zod";
 import {
   CommandHelpResultSchema,
   ProposalDecisionSchema,
@@ -56,7 +57,7 @@ const definitions: readonly CommandDefinition[] = [
   command(
     "ls",
     "List direct children at a current or historical path.",
-    "ls [path] [--revision=N] [--reference=N]",
+    "ls [path] [--revision=N] [--reference=N] [--briefing|-a]",
     "ls",
     (sessionId, args) => listInput(sessionId, args),
   ),
@@ -70,34 +71,30 @@ const definitions: readonly CommandDefinition[] = [
   command(
     "mkdir",
     "Create a child node while remaining in its parent.",
-    "mkdir <name> [work-json]",
+    "mkdir <name> [work-json] [--local]",
     "mkdir",
-    (sessionId, args) => ({
-      sessionId,
-      name: requiredString(args, 0, "name"),
-      work: optionalWorkPatch(args, 1),
-    }),
+    (sessionId, args) => mkdirInput(sessionId, args),
   ),
   command(
     "edit",
     "Patch the current node's work payload.",
-    "edit <patch-json>",
+    "edit <patch-json> [--local]",
     "edit",
-    (sessionId, args) => ({ sessionId, patch: requiredWorkPatch(args, 0) }),
+    (sessionId, args) => patchInput(sessionId, args),
   ),
   command(
     "mv",
     "Move or rename a node using filesystem paths.",
-    "mv <source> <destination>",
+    "mv <source> <destination> [--local]",
     "mv",
-    (sessionId, args) => ({ sessionId, ...twoPaths(args) }),
+    (sessionId, args) => moveInput(sessionId, args),
   ),
   command(
     "close",
     "Close current work and return to its parent where possible.",
-    "close <done|abandoned|superseded> <summary>",
+    "close <done|abandoned|superseded> <summary> [--local]",
     "close",
-    (sessionId, args) => ({ sessionId, ...closeInput(args) }),
+    (sessionId, args) => closeCommandInput(sessionId, args),
   ),
   command(
     "search",
@@ -128,11 +125,32 @@ const definitions: readonly CommandDefinition[] = [
     (sessionId, args) => revisionShowInput(sessionId, args),
   ),
   command(
-    "fork",
-    "Create a frozen child session from the current revision.",
-    "fork <new-session-id>",
-    "fork",
-    (sessionId, args) => ({ sessionId, newSessionId: exactString(args, "new-session-id") }),
+    "set-identity",
+    "Set this session's local user, groups, and metadata before attachment.",
+    "set-identity <user-id> [groups-json] [metadata-json]",
+    "set-identity",
+    (sessionId, args) => identityInput(sessionId, args),
+  ),
+  command(
+    "publish",
+    "Publish the current private overlay to the inode owner's mailbox.",
+    "publish [path]",
+    "publish",
+    (sessionId, args) => ({ sessionId, path: optionalString(args, 0, "path") }),
+  ),
+  command(
+    "withdraw",
+    "Remove this session's published mailbox candidate while retaining the draft.",
+    "withdraw [path]",
+    "withdraw",
+    (sessionId, args) => ({ sessionId, path: optionalString(args, 0, "path") }),
+  ),
+  command(
+    "chmod",
+    "Set owner-controlled content and topology access modes; use topology group write for a dropbox.",
+    "chmod <content-octal> <topology-octal> [path] [--group=<group-id>]",
+    "chmod",
+    (sessionId, args) => chmodInput(sessionId, args),
   ),
   command(
     "briefing",
@@ -144,22 +162,37 @@ const definitions: readonly CommandDefinition[] = [
   command(
     "proposals",
     "List pending compact and subagent proposals.",
+    "proposals [--scope=local|inbox]",
     "proposals",
-    "proposals",
-    (sessionId, args) => ({ sessionId, ...noArguments(args) }),
+    (sessionId, args) => proposalInput(sessionId, args),
   ),
-  command(
-    "decide-proposal",
-    "Accept, replace, reject, or discard a proposal.",
-    "decide-proposal <proposal-id> <accept|replace|reject|discard> [replacement-json]",
-    "decide-proposal",
-    (sessionId, args) => ({
-      sessionId,
-      proposalId: proposalId(args[0], "proposal-id"),
-      decision: ProposalDecisionSchema.parse(requiredString(args, 1, "decision")),
-      replacement: optionalWorkPatch(args, 2),
-    }),
-  ),
+  {
+    name: "decide-proposal",
+    description: "Accept, replace, reject, or discard a local proposal or an inbox candidate.",
+    usage: "decide-proposal <proposal-id> <accept|replace|reject|discard> [replacement-json] | decide-proposal mailbox <path> <author-session> <accept|replace|reject> [replacement-json]",
+    visibility: "public",
+    requiresSession: true,
+    operation: "decide-proposal",
+    parse: (sessionId, args) => {
+      if (args[0] === "mailbox") {
+        requireArgumentCount(args, 4, 5);
+        return {
+          sessionId,
+          mailbox: true,
+          path: requiredString(args, 1, "path"),
+          authorSessionId: requiredString(args, 2, "author-session"),
+          decision: z.enum(["accept", "replace", "reject"]).parse(requiredString(args, 3, "decision")),
+          replacement: optionalWorkPatch(args, 4),
+        };
+      }
+      return {
+        sessionId,
+        proposalId: proposalId(args[0], "proposal-id"),
+        decision: ProposalDecisionSchema.parse(requiredString(args, 1, "decision")),
+        replacement: optionalWorkPatch(args, 2),
+      };
+    },
+  },
   {
     name: "_submit-proposal",
     description: "Internal lifecycle-hook proposal submission.",
@@ -214,12 +247,82 @@ export function parseCommand(input: CommandInput): ParsedCommand {
     throw new Error("sessionId is required for command: " + commandName);
   }
 
-  if (!["search", "ls", "rev-list", "rev-show", "query-link"].includes(definition.name)) {
+  if (!["search", "ls", "rev-list", "rev-show", "query-link", "mkdir", "edit", "mv", "close", "proposals", "chmod"].includes(definition.name)) {
     rejectLongOptions(arguments_);
   }
 
-  const parsed = definition.parse(input.sessionId ?? "", arguments_);
-  return { kind: "operation", name: definition.operation, input: parsed };
+  const parsed = definition.parse(input.sessionId ?? "", arguments_) as Record<string, unknown>;
+  const mailbox = parsed.mailbox === true;
+  delete parsed.mailbox;
+  return {
+    kind: "operation",
+    name: mailbox ? "decide-mailbox" : definition.operation,
+    input: {
+      ...parsed,
+      ...(input.branch === undefined ? {} : { branch: input.branch }),
+    },
+  };
+}
+
+function mkdirInput(sessionId: string, arguments_: readonly CommandAtom[]): unknown {
+  const parsed = splitOptions(arguments_);
+  ensureOptions(parsed.options, ["local"]);
+  return {
+    sessionId,
+    name: requiredString(parsed.positionals, 0, "name"),
+    work: optionalWorkPatch(parsed.positionals, 1),
+    local: optionFlag(parsed.options, "local"),
+  };
+}
+
+function patchInput(sessionId: string, arguments_: readonly CommandAtom[]): unknown {
+  const parsed = splitOptions(arguments_);
+  ensureOptions(parsed.options, ["local"]);
+  return { sessionId, patch: requiredWorkPatch(parsed.positionals, 0), local: optionFlag(parsed.options, "local") };
+}
+
+function moveInput(sessionId: string, arguments_: readonly CommandAtom[]): unknown {
+  const parsed = splitOptions(arguments_);
+  ensureOptions(parsed.options, ["local"]);
+  return { sessionId, ...twoPaths(parsed.positionals), local: optionFlag(parsed.options, "local") };
+}
+
+function closeCommandInput(sessionId: string, arguments_: readonly CommandAtom[]): unknown {
+  const parsed = splitOptions(arguments_);
+  ensureOptions(parsed.options, ["local"]);
+  return { sessionId, ...closeInput(parsed.positionals), local: optionFlag(parsed.options, "local") };
+}
+
+function identityInput(sessionId: string, arguments_: readonly CommandAtom[]): unknown {
+  requireArgumentCount(arguments_, 1, 3);
+  return {
+    sessionId,
+    userId: requiredString(arguments_, 0, "user-id"),
+    groups: arguments_[1] === undefined ? [] : z.array(z.string()).parse(arguments_[1]),
+    metadata: arguments_[2] === undefined ? {} : requiredObject(arguments_, 2, "metadata-json"),
+  };
+}
+
+function proposalInput(sessionId: string, arguments_: readonly CommandAtom[]): unknown {
+  const parsed = splitOptions(arguments_);
+  ensureOptions(parsed.options, ["scope"]);
+  requireArgumentCount(parsed.positionals, 0);
+  const scope = parsed.options.get("scope");
+  return { sessionId, scope: scope === undefined ? "local" : z.enum(["local", "inbox"]).parse(scope) };
+}
+
+function chmodInput(sessionId: string, arguments_: readonly CommandAtom[]): unknown {
+  const parsed = splitOptions(arguments_);
+  ensureOptions(parsed.options, ["group"]);
+  requireArgumentCount(parsed.positionals, 2, 3);
+  const group = parsed.options.get("group");
+  return {
+    sessionId,
+    contentAccess: accessMode(requiredString(parsed.positionals, 0, "content-octal")),
+    topologyAccess: accessMode(requiredString(parsed.positionals, 1, "topology-octal")),
+    path: optionalString(parsed.positionals, 2, "path"),
+    groupId: group === undefined ? undefined : group === true ? null : group,
+  };
 }
 
 function command(
@@ -269,14 +372,16 @@ function searchInput(sessionId: string, arguments_: readonly CommandAtom[]): unk
 }
 
 function listInput(sessionId: string, arguments_: readonly CommandAtom[]): unknown {
-  const parsed = splitOptions(arguments_);
-  ensureOptions(parsed.options, ["revision", "reference"]);
+  const normalized = arguments_.map((argument) => argument === "-a" ? "--briefing" : argument);
+  const parsed = splitOptions(normalized);
+  ensureOptions(parsed.options, ["revision", "reference", "briefing"]);
   requireArgumentCount(parsed.positionals, 0, 1);
   return {
     sessionId,
     path: optionalString(parsed.positionals, 0, "path"),
     revision: optionRevision(parsed.options, "revision"),
     reference: optionRevision(parsed.options, "reference"),
+    briefing: optionFlag(parsed.options, "briefing"),
   };
 }
 
@@ -503,4 +608,9 @@ function terminalStatus(value: string): "done" | "abandoned" | "superseded" {
   }
 
   return status;
+}
+
+function accessMode(value: string): number {
+  if (!/^[0-7]{3}$/.test(value)) throw new Error("access modes must be three octal digits");
+  return Number.parseInt(value, 8);
 }

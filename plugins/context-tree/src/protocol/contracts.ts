@@ -95,11 +95,18 @@ export interface CurrentDirectory {
 }
 
 /** @schema @strict */
+export interface CurrentFork {
+  name: string;
+  revision: Revision;
+}
+
+/** @schema @strict */
 export interface CurrentWork extends WorkFields {}
 
 /** @schema @strict */
 export interface CursorState {
   current_dir: CurrentDirectory;
+  current_fork: CurrentFork;
 }
 
 /** @schema @strict */
@@ -227,6 +234,7 @@ export interface ListResult extends CursorState {
   listedPath: string;
   view_path?: string;
   entries: EntrySummary[];
+  childBriefings?: BriefingEntry[];
 }
 
 /** @schema @strict */
@@ -248,6 +256,7 @@ export interface RevisionShowResult extends CursorState {
 /** @schema @strict */
 export interface CdResult extends CursorState {
   movedTo: string;
+  briefing: BriefingEntry[];
 }
 
 /** @schema @strict */
@@ -273,6 +282,48 @@ export interface CloseResult extends CursorState {
 /** @schema @strict */
 export interface ProposalListResult extends CursorState {
   proposals: ProposalSummary[];
+  mailbox?: MailboxCandidate[];
+}
+
+/** @schema @strict */
+export interface MailboxCandidate {
+  path: string;
+  subject: "inode" | "link";
+  authorSessionId: string;
+  publishedAt: Timestamp;
+  baseWork: CurrentWork | null;
+  candidateWork: CurrentWork | null;
+  stale: boolean;
+}
+
+/** @schema @strict */
+export interface IdentityResult {
+  userId: string;
+  groups: string[];
+}
+
+/** @schema @strict */
+export interface MailboxResult extends CursorState {
+  path: string;
+  subject: "inode" | "link";
+  published: boolean;
+}
+
+/** @schema @strict */
+export interface MailboxDecisionResult extends CursorState {
+  path: string;
+  authorSessionId: string;
+  status: "applied" | "rejected";
+  before: CurrentWork;
+  after: CurrentWork | null;
+}
+
+/** @schema @strict */
+export interface AccessResult extends CursorState {
+  path: string;
+  contentAccess: number;
+  topologyAccess: number;
+  groupId: string | null;
 }
 
 /** @schema @strict */
@@ -292,6 +343,8 @@ export interface ForkResult extends CursorState {
 export interface CommandInput {
   /** Required for every command except help. */
   sessionId?: string;
+  /** Optional read-only branch selector. */
+  branch?: string;
   /** @minItems 1 */
   command: CommandAtom[];
 }

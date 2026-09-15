@@ -55,6 +55,7 @@ async function invoke(input: CommandInput, timeout: number, key: string | undefi
       name: "command",
       arguments: {
         ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+        ...(input.branch ? { branch: input.branch } : {}),
         command: input.command,
       },
       ...(key ? { _meta: { "context-tree/idempotency-key": key } } : {}),

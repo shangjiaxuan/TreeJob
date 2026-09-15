@@ -26,7 +26,7 @@ as `{ sessionId: "session", command: ["mkdir", "investigate", {"returnCondition"
   resolves at the current head, so it follows a moved or renamed node; add
   `--reference=N` only when a historical path is the intended identity source.
 - Do not infer storage details from revision output. Inode and link identities,
-  scratch physical records, published-reference streams, and frozen fork spans
+  shared mainline records, private session overlays, and owner mailboxes
   are daemon internals. A session revision is the fixed historical view that
   selects effective published node and link records; diagnostic events are not
   part of state resolution.

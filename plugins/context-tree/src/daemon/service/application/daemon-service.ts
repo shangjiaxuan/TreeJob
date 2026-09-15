@@ -12,6 +12,10 @@ import {
   type CursorState,
   type EditResult,
   type EntrySummary,
+  type IdentityResult,
+  type MailboxResult,
+  type MailboxDecisionResult,
+  type AccessResult,
   type MkdirResult,
   type MoveResult,
   type ProposalSummary,
@@ -34,6 +38,9 @@ export class ContinuationController {
 
   execute(raw: unknown, idempotencyKey?: string): unknown {
     const input = CommandInputSchema.parse(raw);
+    if (input.branch !== undefined && input.branch !== "main") {
+      throw new RepositoryError("not_found", "v9 exposes only the main branch");
+    }
     const parsed = parseCommand(input);
     if (parsed.kind === "help") return parsed.result;
     return this.dispatch(parsed.name, parsed.input, idempotencyKey);
@@ -73,9 +80,14 @@ export class ContinuationController {
       case "query-link": return this.queryLink(raw);
       case "rev-show": return this.revisionShow(raw);
       case "fork": return this.fork(raw, key);
+      case "set-identity": return this.setIdentity(raw, key);
+      case "publish": return this.publish(raw, key);
+      case "withdraw": return this.withdraw(raw, key);
+      case "chmod": return this.chmod(raw, key);
       case "briefing": return this.briefing(raw);
       case "proposals": return this.proposals(raw);
       case "decide-proposal": return this.decideProposal(raw, key);
+      case "decide-mailbox": return this.decideMailbox(raw, key);
       case "submit-proposal": return this.submitProposal(raw, key);
     }
   }
@@ -83,15 +95,19 @@ export class ContinuationController {
   private pwd(raw: unknown, key: string | null): PwdState {
     const input = OperationSchemas.pwd.input.parse(raw);
     const existing = this.records.findSession(input.sessionId);
-    if (existing && input.cwd) this.model.validateWorkspace(existing, input.cwd);
+    if (existing && existing.branchId !== 0 && input.cwd) this.model.validateWorkspace(existing, input.cwd);
     return this.command(input.sessionId, key, OperationSchemas.pwd.output, () => {
-      if (existing) {
+      if (existing && existing.branchId !== 0) {
         return this.pwdState(this.model.resolveSession(input.sessionId));
       }
       const created = this.model.createSession(input.sessionId, input.cwd ?? process.cwd());
-      const revision = this.records.reserveNextRevision(input.sessionId);
-      this.records.insertSpan(input.sessionId, revision, null);
-      this.records.publishReferences(input.sessionId, revision, created.nodeRecords, []);
+      if (created.nodeRecords.length === 0) {
+        return this.pwdState(this.model.resolveSession(input.sessionId));
+      }
+      const attached = this.records.getSession(input.sessionId);
+      const revision = this.records.reserveNextRevision(attached.branchId);
+      this.records.insertSpan(attached.branchId, revision, null);
+      this.records.publishReferences(attached.branchId, revision, created.nodeRecords, []);
       this.records.updateSessionHead(input.sessionId, revision, created.cursorLinkPath);
       this.appendEvent(input.sessionId, revision, "session-created", created.rootNodeId, created.cursorLinkPath, key, {});
       return this.pwdState(this.model.resolveSession(input.sessionId));
@@ -107,6 +123,7 @@ export class ContinuationController {
         ...this.cursorState(live),
         listedPath: this.model.path(listed),
         entries: this.entries(live.view, listed),
+        ...(input.briefing ? { childBriefings: this.childBriefings(live.view, listed) } : {}),
       };
     }
     const view = this.model.resolveView(
@@ -120,6 +137,7 @@ export class ContinuationController {
       listedPath: this.model.path(view.node),
       view_path: this.model.path(view.node),
       entries: this.entries(view.selected, view.node),
+      ...(input.briefing ? { childBriefings: this.childBriefings(view.selected, view.node) } : {}),
     };
   }
 
@@ -129,7 +147,11 @@ export class ContinuationController {
       const resolved = this.model.resolveSession(input.sessionId);
       const mutation = this.model.cd(resolved, input.path);
       const next = this.persistCursorOnly(resolved, "cd", key, mutation.cursorLinkPath);
-      return { ...this.cursorState(next), movedTo: this.model.path(this.model.current(next)) };
+      return {
+        ...this.cursorState(next),
+        movedTo: this.model.path(this.model.current(next)),
+        briefing: this.briefingEntries(next),
+      };
     });
   }
 
@@ -137,7 +159,7 @@ export class ContinuationController {
     const input = OperationSchemas.mkdir.input.parse(raw);
     return this.command(input.sessionId, key, OperationSchemas.mkdir.output, () => {
       const resolved = this.model.resolveSession(input.sessionId);
-      const mutation = this.model.mkdir(resolved, input.name, input.work ?? {});
+      const mutation = this.model.mkdir(resolved, input.name, input.work ?? {}, input.local ?? false);
       const next = this.persistMutation(resolved, "mkdir", key, mutation);
       const created = this.model.resolvePath(next, input.name);
       return { ...this.cursorState(next), created: this.entry(next.view, created) };
@@ -150,7 +172,7 @@ export class ContinuationController {
     return this.command(input.sessionId, key, OperationSchemas.edit.output, () => {
       const resolved = this.model.resolveSession(input.sessionId);
       const current = this.model.current(resolved);
-      const mutation = this.model.edit(resolved, input.patch);
+      const mutation = this.model.edit(resolved, input.patch, input.local ?? false);
       const next = this.persistMutation(resolved, "edit", key, mutation);
       return {
         ...this.cursorState(next),
@@ -165,7 +187,7 @@ export class ContinuationController {
       const resolved = this.model.resolveSession(input.sessionId);
       const source = this.model.resolvePath(resolved, input.source);
       const from = this.model.path(source);
-      const mutation = this.model.move(resolved, input.source, input.destination);
+      const mutation = this.model.move(resolved, input.source, input.destination, input.local ?? false);
       const next = this.persistMutation(resolved, "mv", key, mutation);
       const moved = this.model.findNodeAtView(next.view, source.nodeId);
       if (moved === null) throw new RepositoryError("invariant", "moved node is not reachable");
@@ -178,7 +200,7 @@ export class ContinuationController {
     return this.command(input.sessionId, key, OperationSchemas.close.output, () => {
       const resolved = this.model.resolveSession(input.sessionId);
       const current = this.model.current(resolved);
-      const mutation = this.model.close(resolved, input.summary, input.status);
+      const mutation = this.model.close(resolved, input.summary, input.status, input.local ?? false);
       const next = this.persistMutation(resolved, "close", key, mutation);
       return {
         ...this.cursorState(next),
@@ -274,28 +296,85 @@ export class ContinuationController {
   private fork(raw: unknown, key: string | null) {
     const input = OperationSchemas.fork.input.parse(raw);
     return this.command(input.sessionId, key, OperationSchemas.fork.output, () => {
-      const before = this.model.resolveSession(input.sessionId);
-      const existing = this.records.findSession(input.newSessionId);
-      const forked = this.model.fork(before, input.newSessionId);
-      if (existing === null) {
-        const revision = this.records.reserveNextRevision(input.newSessionId);
-        this.records.insertSpan(input.newSessionId, revision, before.view);
-        this.records.publishReferences(input.newSessionId, revision, forked.nodeRecords, []);
-        this.records.updateSessionHead(input.newSessionId, revision, forked.cursorLinkPath);
-        this.appendEvent(
-          input.newSessionId,
-          revision,
-          "fork-created",
-          forked.rootNodeId,
-          forked.cursorLinkPath,
-          key,
-          { parentSessionId: before.session.id, parentRevision: before.view.revision },
-        );
-      }
-      this.appendEvent(input.sessionId, null, "fork", null, before.session.cursorLinkPath, key, {
-        forkedSessionId: input.newSessionId,
+      throw new RepositoryError("invariant", "explicit forks are deferred in the shared-mainline v9 store");
+    });
+  }
+
+  private setIdentity(raw: unknown, key: string | null): IdentityResult {
+    const input = OperationSchemas["set-identity"].input.parse(raw);
+    return this.command(input.sessionId, key, OperationSchemas["set-identity"].output, () => {
+      const session = this.records.setIdentity(
+        input.sessionId,
+        input.userId,
+        input.groups ?? [],
+        input.metadata ?? {},
+      );
+      return { userId: session.userId, groups: session.groups };
+    });
+  }
+
+  private publish(raw: unknown, key: string | null): MailboxResult {
+    const input = OperationSchemas.publish.input.parse(raw);
+    return this.command(input.sessionId, key, OperationSchemas.publish.output, () => {
+      const resolved = this.model.resolveSession(input.sessionId);
+      const target = this.model.resolvePath(resolved, input.path ?? ".");
+      const overlay = this.records.latestOverlay(
+        resolved.session.id,
+        "inode",
+        target.nodeId,
+        resolved.session.overlayHeadRevision,
+      );
+      if (overlay === null) throw new RepositoryError("not_found", "no local overlay exists for this node");
+      this.records.publishMailbox({
+        authorityInodeId: target.nodeId,
+        subjectKind: "inode",
+        subjectId: target.nodeId,
+        authorSessionId: resolved.session.id,
+        publishedOverlayRevision: overlay.overlayRevision,
+        baseBranchId: overlay.baseBranchId,
+        baseBranchRevision: overlay.baseBranchRevision,
+        baseRecordId: overlay.baseRecordId,
+        candidateRecordId: overlay.candidateRecordId,
+        publishedAt: new Date().toISOString(),
       });
-      return { ...this.cursorState(before), forkedSessionId: input.newSessionId };
+      this.appendEvent(resolved.session.id, null, "publish", target.nodeId, resolved.session.cursorLinkPath, key, {});
+      return { ...this.cursorState(resolved), path: this.model.path(target), subject: "inode", published: true };
+    });
+  }
+
+  private withdraw(raw: unknown, key: string | null): MailboxResult {
+    const input = OperationSchemas.withdraw.input.parse(raw);
+    return this.command(input.sessionId, key, OperationSchemas.withdraw.output, () => {
+      const resolved = this.model.resolveSession(input.sessionId);
+      const target = this.model.resolvePath(resolved, input.path ?? ".");
+      this.records.withdrawMailbox(target.nodeId, "inode", target.nodeId, resolved.session.id);
+      this.appendEvent(resolved.session.id, null, "withdraw", target.nodeId, resolved.session.cursorLinkPath, key, {});
+      return { ...this.cursorState(resolved), path: this.model.path(target), subject: "inode", published: false };
+    });
+  }
+
+  private chmod(raw: unknown, key: string | null): AccessResult {
+    const input = OperationSchemas.chmod.input.parse(raw);
+    return this.command(input.sessionId, key, OperationSchemas.chmod.output, () => {
+      const resolved = this.model.resolveSession(input.sessionId);
+      const target = this.model.resolvePath(resolved, input.path ?? ".");
+      const inode = this.records.getInode(target.nodeId);
+      if (inode.ownerUserId !== resolved.session.userId) {
+        throw new RepositoryError("conflict", "only the inode owner may change access modes");
+      }
+      const groupId = input.groupId === undefined ? inode.groupId : input.groupId;
+      this.records.updateInodeAccess(target.nodeId, {
+        content: input.contentAccess,
+        topology: input.topologyAccess,
+      }, groupId);
+      this.appendEvent(resolved.session.id, null, "chmod", target.nodeId, resolved.session.cursorLinkPath, key, {});
+      return {
+        ...this.cursorState(resolved),
+        path: this.model.path(target),
+        contentAccess: input.contentAccess,
+        topologyAccess: input.topologyAccess,
+        groupId,
+      };
     });
   }
 
@@ -304,18 +383,7 @@ export class ContinuationController {
     const resolved = this.model.resolveSession(input.sessionId);
     return {
       ...this.cursorState(resolved),
-      ancestry: resolved.nodes.map((node) => ({
-        path: this.model.path(node),
-        work: this.model.work(node),
-        closedChildOutcomes: this.model.entries(resolved.view, node)
-          .filter(({ child }) => ["done", "abandoned", "superseded"].includes(child.record.attributes.status))
-          .map(({ name, child }) => ({
-            path: this.model.path(child),
-            title: child.record.attributes.title || name,
-            status: child.record.attributes.status as "done" | "abandoned" | "superseded",
-            summary: child.record.attributes.currentState,
-          })),
-      })),
+      ancestry: this.briefingEntries(resolved),
       pendingProposalCount: this.records.listPendingProposals(input.sessionId).length,
       unresolvedCount: this.model.allNodes(resolved)
         .filter((node) => !["done", "abandoned", "superseded"].includes(node.record.attributes.status))
@@ -326,6 +394,29 @@ export class ContinuationController {
   private proposals(raw: unknown) {
     const input = OperationSchemas.proposals.input.parse(raw);
     const resolved = this.model.resolveSession(input.sessionId);
+    if (input.scope === "inbox") {
+      return {
+        ...this.cursorState(resolved),
+        proposals: [],
+        mailbox: this.records.listMailbox(resolved.session.userId).map((entry) => {
+          const node = this.model.findNodeAtView(resolved.view, entry.authorityInodeId);
+          const current = this.records.resolveNodeRecord(entry.authorityInodeId, {
+            ...resolved.view,
+            overlaySessionId: null,
+            overlayHeadRevision: 0,
+          });
+          return {
+            path: node === null ? "(not reachable)" : this.model.path(node),
+            subject: entry.subjectKind,
+            authorSessionId: entry.authorSessionId,
+            publishedAt: entry.publishedAt,
+            baseWork: entry.subjectKind === "inode" ? this.records.getNodeRecord(entry.baseRecordId).attributes : null,
+            candidateWork: entry.subjectKind === "inode" ? this.records.getNodeRecord(entry.candidateRecordId).attributes : null,
+            stale: current.id !== entry.baseRecordId,
+          };
+        }),
+      };
+    }
     return {
       ...this.cursorState(resolved),
       proposals: this.records.listPendingProposals(input.sessionId).map((proposal) => this.proposal(proposal)),
@@ -357,6 +448,70 @@ export class ContinuationController {
         after: decision.kind === "state"
           ? this.records.resolveNodeRecord(proposal.targetNodeId, next.view).attributes
           : null,
+      };
+    });
+  }
+
+  private decideMailbox(raw: unknown, key: string | null): MailboxDecisionResult {
+    const input = OperationSchemas["decide-mailbox"].input.parse(raw);
+    return this.command(input.sessionId, key, OperationSchemas["decide-mailbox"].output, () => {
+      const resolved = this.model.resolveSession(input.sessionId);
+      const target = this.model.resolvePath(resolved, input.path);
+      const inode = this.records.getInode(target.nodeId);
+      if (inode.ownerUserId !== resolved.session.userId) {
+        throw new RepositoryError("conflict", "only the inode owner may decide its mailbox candidates");
+      }
+      const entry = this.records.getMailbox(target.nodeId, "inode", target.nodeId, input.authorSessionId);
+      if (entry === null) throw new RepositoryError("not_found", "mailbox candidate not found");
+      const authoritative = this.records.resolveNodeRecord(target.nodeId, {
+        ...resolved.view,
+        overlaySessionId: null,
+        overlayHeadRevision: 0,
+      });
+      const before = authoritative.attributes;
+
+      if (input.decision === "reject") {
+        this.records.withdrawMailbox(target.nodeId, "inode", target.nodeId, input.authorSessionId);
+        this.appendEvent(resolved.session.id, null, "mailbox-reject", target.nodeId, resolved.session.cursorLinkPath, key, {});
+        return {
+          ...this.cursorState(resolved),
+          path: this.model.path(target),
+          authorSessionId: input.authorSessionId,
+          status: "rejected",
+          before,
+          after: null,
+        };
+      }
+
+      if (authoritative.id !== entry.baseRecordId) {
+        throw new RepositoryError("conflict", "mailbox candidate is stale against the current mainline record");
+      }
+      const replacement = input.decision === "replace"
+        ? input.replacement
+        : null;
+      if (input.decision === "replace" && replacement === undefined) {
+        throw new RepositoryError("invariant", "replace requires a work patch");
+      }
+      this.assertNonTerminalPatch(replacement ?? {});
+      const candidate = input.decision === "accept"
+        ? this.records.getNodeRecord(entry.candidateRecordId)
+        : this.records.insertNodeRecord(target.nodeId, WorkFieldsSchema.parse({ ...before, ...replacement }));
+      if (candidate.nodeId !== target.nodeId) throw new RepositoryError("invariant", "mailbox candidate targets the wrong inode");
+      const next = this.persistMutation(resolved, "mailbox-accept", key, {
+        cursorLinkPath: resolved.session.cursorLinkPath,
+        mode: "main",
+        nodeRecords: [candidate],
+        linkRecords: [],
+        overlays: [],
+      });
+      this.records.withdrawMailbox(target.nodeId, "inode", target.nodeId, input.authorSessionId);
+      return {
+        ...this.cursorState(next),
+        path: this.model.path(target),
+        authorSessionId: input.authorSessionId,
+        status: "applied",
+        before,
+        after: this.records.resolveNodeRecord(target.nodeId, next.view).attributes,
       };
     });
   }
@@ -410,12 +565,41 @@ export class ContinuationController {
     key: string | null,
     mutation: {
       cursorLinkPath: Id[];
+      mode?: "main" | "overlay";
       nodeRecords: readonly NodeRecord[];
       linkRecords: readonly { record: LinkRecord; previousParentNodeId: Id | null }[];
+      overlays?: ReadonlyArray<{
+        subjectKind: "inode" | "link";
+        subjectId: Id;
+        authorityInodeId: Id;
+        baseRecordId: Id;
+        candidateRecordId: Id;
+        parentNodeId: Id | null;
+      }>;
     },
   ): ResolvedSession {
-    const revision = this.records.reserveNextRevision(resolved.session.id);
-    this.records.publishReferences(resolved.session.id, revision, mutation.nodeRecords, mutation.linkRecords);
+    if (mutation.mode === "overlay") {
+      const overlayRevision = resolved.session.overlayHeadRevision + 1;
+      for (const overlay of mutation.overlays ?? []) {
+        this.records.appendOverlay({
+          sessionId: resolved.session.id,
+          subjectKind: overlay.subjectKind,
+          subjectId: overlay.subjectId,
+          overlayRevision,
+          baseBranchId: resolved.view.branchId,
+          baseBranchRevision: resolved.view.revision,
+          baseRecordId: overlay.baseRecordId,
+          candidateRecordId: overlay.candidateRecordId,
+          parentNodeId: overlay.parentNodeId,
+          createdAt: new Date().toISOString(),
+        });
+      }
+      this.records.updateSessionCursor(resolved.session.id, mutation.cursorLinkPath);
+      this.appendEvent(resolved.session.id, null, operation + "-overlay", resolved.view.rootNodeId, mutation.cursorLinkPath, key, {});
+      return this.model.resolveSession(resolved.session.id);
+    }
+    const revision = this.records.reserveNextRevision(resolved.session.branchId);
+    this.records.publishReferences(resolved.session.branchId, revision, mutation.nodeRecords, mutation.linkRecords);
     this.records.updateSessionHead(resolved.session.id, revision, mutation.cursorLinkPath);
     this.appendEvent(resolved.session.id, revision, operation, resolved.view.rootNodeId, mutation.cursorLinkPath, key, {});
     return this.model.resolveSession(resolved.session.id);
@@ -463,7 +647,40 @@ export class ContinuationController {
       path: this.model.path(current),
       canGoBack: current.linkPath.length > 0,
     };
-    return { current_dir };
+    return {
+      current_dir,
+      current_fork: { name: "main", revision: resolved.view.revision },
+    };
+  }
+
+  private briefingEntries(resolved: ResolvedSession): BriefingResult["ancestry"] {
+    return resolved.nodes.map((node) => ({
+      path: this.model.path(node),
+      work: this.model.work(node),
+      closedChildOutcomes: this.model.entries(resolved.view, node)
+        .filter(({ child }) => ["done", "abandoned", "superseded"].includes(child.record.attributes.status))
+        .map(({ name, child }) => ({
+          path: this.model.path(child),
+          title: child.record.attributes.title || name,
+          status: child.record.attributes.status as "done" | "abandoned" | "superseded",
+          summary: child.record.attributes.currentState,
+        })),
+    }));
+  }
+
+  private childBriefings(view: View, node: ResolvedNode): BriefingResult["ancestry"] {
+    return this.model.entries(view, node).map(({ child }) => ({
+      path: this.model.path(child),
+      work: this.model.work(child),
+      closedChildOutcomes: this.model.entries(view, child)
+        .filter(({ child: grandchild }) => ["done", "abandoned", "superseded"].includes(grandchild.record.attributes.status))
+        .map(({ name, child: grandchild }) => ({
+          path: this.model.path(grandchild),
+          title: grandchild.record.attributes.title || name,
+          status: grandchild.record.attributes.status as "done" | "abandoned" | "superseded",
+          summary: grandchild.record.attributes.currentState,
+        })),
+    }));
   }
 
   private pwdState(resolved: ResolvedSession): PwdState {

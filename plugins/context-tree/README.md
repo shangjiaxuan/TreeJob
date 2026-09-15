@@ -1,11 +1,11 @@
 # Context Tree
 
-Context Tree is a local persistent continuation notebook for Codex. Its v8
-storage model separates stable inode and link identities from the lightweight
-physical records that materialize their work and topology. A public
-per-session timeline (`r0`, `r1`, ...) publishes those physical record IDs.
-Each revision is a frozen `{session, revision}` view; it is not an event-log
-replay.
+Context Tree is a local persistent continuation notebook for Codex. Its v9
+model is a shared workspace filesystem: sessions are users on a shared `main`
+branch, rather than private branches. Stable inode and link identities remain
+separate from immutable physical payload, node, and link records. Mainline
+revisions publish physical record IDs; events are diagnostic only, never a
+state-replay source.
 
 Source checkouts contain only authored files. Build the ignored staged
 marketplace artifact before installing it in Codex; the artifact bundles its
@@ -60,6 +60,9 @@ The shell prints the exact compact daemon result. Its commands are:
     mkdir migration {"objective":"Ship it"}
     cd migration
     edit {"currentState":"Checking schema safety"}
+    publish
+    proposals --scope=inbox
+    decide-proposal mailbox . collaborator-session accept
     rev-list /migration
     close done "Checked migration safety"
     search migration --scope=workspace
@@ -79,14 +82,25 @@ Unicode NFC and case-sensitive. `mv` retains stable node and directory-link
 identity for a same-name move or a rename. Record and snapshot IDs are internal
 implementation details.
 
-Every state mutation first writes unreachable physical payload, node, or link
-records, then reserves its next session revision and publishes only its changed
-record IDs. `cd` changes only the cursor. A sparse session-span table freezes
-fork ancestry, so resolution makes bounded indexed probes: it seeks a visible
-published inode or link record in the applicable span and only then follows the
-frozen source span. Events are diagnostics, never state. A child work update
-therefore publishes one node reference without rewriting its parents; a rename
-or move publishes link references without rewriting the child work.
+Every mainline mutation first writes unreachable physical payload, node, or
+link records, reserves the next shared-branch revision, then publishes only
+the changed record IDs. `cd` changes only the session cursor. A private edit
+creates a session overlay when the caller lacks the appropriate inode
+capability, or when `--local` is supplied. `publish [path]` makes the latest
+overlay visible in the inode owner's mailbox; it never changes `main`.
+`decide-proposal mailbox <path> <author-session> accept` validates the
+candidate base record and publishes one authoritative mainline revision.
+Rejected, withdrawn, and accepted mailbox pointers do not delete the author's
+draft records.
+
+`set-identity <user-id> [groups-json] [metadata-json]` sets the trusted local
+PoC identity before `pwd` attaches the session to a workspace. `chmod
+<content-octal> <topology-octal> [path] [--group=<group>]` lets an inode owner
+set separate content and topology capabilities. For example, a directory with
+group topology write is a dropbox: group members can append children to main,
+while those child inodes remain owned by their creators. `ls -a` (or `ls
+--briefing`) gives bounded direct-child briefings; `cd` returns an active-path
+briefing for its destination.
 
 `rev-list [path] [--reference=N]` reports semantic work, child, rename, and
 move history. Add `--verbose` to include the originating `{ sessionId,

@@ -5,6 +5,7 @@ import {
   type Id,
   type LinkRecord,
   type NodeRecord,
+  type OverlaySubject,
   type Proposal,
   type RecordRepository,
   type Session,
@@ -37,8 +38,19 @@ export type ResolvedSession = {
 export type StateMutation = {
   changed: boolean;
   cursorLinkPath: Id[];
+  mode: "main" | "overlay";
   nodeRecords: NodeRecord[];
   linkRecords: Array<{ record: LinkRecord; previousParentNodeId: Id | null }>;
+  overlays: OverlayDraft[];
+};
+
+export type OverlayDraft = {
+  subjectKind: OverlaySubject;
+  subjectId: Id;
+  authorityInodeId: Id;
+  baseRecordId: Id;
+  candidateRecordId: Id;
+  parentNodeId: Id | null;
 };
 
 export type InitializedSession = {
@@ -61,26 +73,29 @@ type PathSegment = { value: string; escaped: boolean };
 type LinkLocation = { parentNodeId: Id; name: string };
 
 /**
- * v8 creates physical records first. The controller alone publishes their
- * references into the session revision selected by this mutation.
+ * v9 creates physical records first. The controller alone publishes their
+ * references into the shared branch revision selected by this mutation.
  */
 export class ContinuationModel {
   constructor(private readonly records: RecordRepository) {}
 
   createSession(sessionId: string, cwd: string): InitializedSession {
-    const createdAt = this.timestamp();
-    const rootNodeId = this.records.createNode();
+    const workspacePath = resolveFilesystemPath(cwd);
+    const session = this.records.findSession(sessionId)
+      ?? this.records.setIdentity(sessionId, sessionId, [], {});
+    const existing = this.records.findFilesystem(workspacePath);
+
+    if (existing !== null) {
+      this.records.attachSession(sessionId, existing.id, existing.mainBranchId, []);
+      return { rootNodeId: existing.rootNodeId, cursorLinkPath: [], nodeRecords: [] };
+    }
+
+    const rootNodeId = this.records.createNode(session.userId, session.groups[0] ?? null);
     const rootRecord = this.records.insertNodeRecord(rootNodeId, this.emptyWork());
-    this.records.insertSession({
-      id: sessionId,
-      workspacePath: resolveFilesystemPath(cwd),
-      rootNodeId,
-      headRevision: -1,
-      headRevisionCreatedAt: createdAt,
-      cursorLinkPath: [],
-      createdAt,
-      updatedAt: createdAt,
-    });
+    const filesystemId = this.records.createFilesystem(workspacePath, rootNodeId);
+    const branchId = this.records.createMainBranch(filesystemId);
+    this.records.setFilesystemMainBranch(filesystemId, branchId);
+    this.records.attachSession(sessionId, filesystemId, branchId, []);
     return { rootNodeId, cursorLinkPath: [], nodeRecords: [rootRecord] };
   }
 
@@ -124,38 +139,70 @@ export class ContinuationModel {
     return { selected, node };
   }
 
-  mkdir(resolved: ResolvedSession, name: string, patch: WorkPatch): StateMutation {
+  mkdir(resolved: ResolvedSession, name: string, patch: WorkPatch, forceLocal = false): StateMutation {
     const parent = this.current(resolved);
+    const mode = this.writeMode(resolved, parent.nodeId, "topology", 1, forceLocal);
     const normalizedName = this.normalizeName(name);
     this.ensureNameAvailable(this.entries(resolved.view, parent), normalizedName);
-    const childNodeId = this.records.createNode();
+    const parentInode = this.records.getInode(parent.nodeId);
+    const childNodeId = this.records.createNode(resolved.session.userId, parentInode.groupId);
     const link = this.records.createLink(childNodeId);
     const childRecord = this.records.insertNodeRecord(childNodeId, this.mergeWork(this.emptyWork(), patch));
     const linkRecord = this.records.insertLinkRecord(link.id, parent.nodeId, normalizedName);
+    const baseParent = this.authoritativeNode(resolved, parent.nodeId);
     return {
       changed: true,
       cursorLinkPath: resolved.session.cursorLinkPath,
-      nodeRecords: [childRecord],
-      linkRecords: [{ record: linkRecord, previousParentNodeId: null }],
+      mode,
+      nodeRecords: mode === "main" ? [childRecord] : [],
+      linkRecords: mode === "main" ? [{ record: linkRecord, previousParentNodeId: null }] : [],
+      overlays: mode === "main" ? [] : [
+        {
+          subjectKind: "inode",
+          subjectId: childNodeId,
+          authorityInodeId: childNodeId,
+          baseRecordId: 0,
+          candidateRecordId: childRecord.id,
+          parentNodeId: null,
+        },
+        {
+          subjectKind: "link",
+          subjectId: link.id,
+          authorityInodeId: parent.nodeId,
+          baseRecordId: baseParent.id,
+          candidateRecordId: linkRecord.id,
+          parentNodeId: parent.nodeId,
+        },
+      ],
     };
   }
 
-  edit(resolved: ResolvedSession, patch: WorkPatch): StateMutation {
+  edit(resolved: ResolvedSession, patch: WorkPatch, forceLocal = false): StateMutation {
     const current = this.current(resolved);
+    const mode = this.writeMode(resolved, current.nodeId, "content", 2, forceLocal);
     const record = this.records.insertNodeRecord(current.nodeId, this.mergeWork(current.record.attributes, patch));
-    return { changed: true, cursorLinkPath: resolved.session.cursorLinkPath, nodeRecords: [record], linkRecords: [] };
+    return {
+      changed: true,
+      cursorLinkPath: resolved.session.cursorLinkPath,
+      mode,
+      nodeRecords: mode === "main" ? [record] : [],
+      linkRecords: [],
+      overlays: mode === "main" ? [] : [this.nodeOverlay(resolved, current.nodeId, record.id)],
+    };
   }
 
   cd(resolved: ResolvedSession, path: string): StateMutation {
-    return { changed: false, cursorLinkPath: this.resolvePath(resolved, path).linkPath, nodeRecords: [], linkRecords: [] };
+    return { changed: false, cursorLinkPath: this.resolvePath(resolved, path).linkPath, mode: "main", nodeRecords: [], linkRecords: [], overlays: [] };
   }
 
   close(
     resolved: ResolvedSession,
     summary: string,
     status: "done" | "abandoned" | "superseded",
+    forceLocal = false,
   ): StateMutation {
     const current = this.current(resolved);
+    const mode = this.writeMode(resolved, current.nodeId, "content", 1, forceLocal);
     if (this.hasOpenDescendant(resolved.view, current, new Set([current.nodeId]))) {
       throw new RepositoryError("invariant", "cannot close a node with open descendants");
     }
@@ -166,18 +213,23 @@ export class ContinuationModel {
     return {
       changed: true,
       cursorLinkPath: current.linkPath.length === 0 ? current.linkPath : current.linkPath.slice(0, -1),
-      nodeRecords: [record],
+      mode,
+      nodeRecords: mode === "main" ? [record] : [],
       linkRecords: [],
+      overlays: mode === "main" ? [] : [this.nodeOverlay(resolved, current.nodeId, record.id)],
     };
   }
 
-  move(resolved: ResolvedSession, sourcePath: string, destinationPath: string): StateMutation {
+  move(resolved: ResolvedSession, sourcePath: string, destinationPath: string, forceLocal = false): StateMutation {
     const source = this.resolvePath(resolved, sourcePath);
     if (source.linkId === null || source.linkPath.length === 0) {
       throw new RepositoryError("invariant", "cannot move the root node");
     }
     const sourceLink = this.records.resolveLinkRecord(source.linkId, resolved.view);
     const destination = this.resolveMoveDestination(resolved, destinationPath, sourceLink.name);
+    const sourceMode = this.writeMode(resolved, sourceLink.parentNodeId, "topology", 1, forceLocal);
+    const destinationMode = this.writeMode(resolved, destination.parent.nodeId, "topology", 1, forceLocal);
+    const mode = sourceMode === "main" && destinationMode === "main" ? "main" : "overlay";
     if (this.startsWith(destination.parent.linkPath, source.linkPath)) {
       throw new RepositoryError("invariant", "cannot move a node into its descendant");
     }
@@ -190,8 +242,17 @@ export class ContinuationModel {
         source.linkPath,
         [...destination.parent.linkPath, source.linkId],
       ),
+      mode,
       nodeRecords: [],
-      linkRecords: [{ record, previousParentNodeId: sourceLink.parentNodeId }],
+      linkRecords: mode === "main" ? [{ record, previousParentNodeId: sourceLink.parentNodeId }] : [],
+      overlays: mode === "main" ? [] : [{
+        subjectKind: "link",
+        subjectId: source.linkId,
+        authorityInodeId: sourceLink.parentNodeId,
+        baseRecordId: this.authoritativeLink(resolved, source.linkId).id,
+        candidateRecordId: record.id,
+        parentNodeId: destination.parent.nodeId,
+      }],
     };
   }
 
@@ -200,17 +261,10 @@ export class ContinuationModel {
     if (existing !== null) {
       return { rootNodeId: existing.rootNodeId, cursorLinkPath: existing.cursorLinkPath, nodeRecords: [] };
     }
-    const createdAt = this.timestamp();
-    this.records.insertSession({
-      id: newSessionId,
-      workspacePath: resolved.session.workspacePath,
-      rootNodeId: resolved.view.rootNodeId,
-      headRevision: -1,
-      headRevisionCreatedAt: createdAt,
-      cursorLinkPath: resolved.session.cursorLinkPath,
-      createdAt,
-      updatedAt: createdAt,
-    });
+    this.records.setIdentity(newSessionId, newSessionId, [], {});
+    const filesystem = this.records.findFilesystem(resolved.session.workspacePath);
+    if (filesystem === null) throw new RepositoryError("invariant", "session filesystem is missing");
+    this.records.attachSession(newSessionId, filesystem.id, filesystem.mainBranchId, resolved.session.cursorLinkPath);
     return {
       rootNodeId: resolved.view.rootNodeId,
       cursorLinkPath: resolved.session.cursorLinkPath,
@@ -360,6 +414,51 @@ export class ContinuationModel {
 
   private root(view: View): ResolvedNode {
     return this.resolveNode(view, view.rootNodeId, [], [], null);
+  }
+
+  private nodeOverlay(resolved: ResolvedSession, nodeId: Id, candidateRecordId: Id): OverlayDraft {
+    const inode = this.records.getInode(nodeId);
+    return {
+      subjectKind: "inode",
+      subjectId: nodeId,
+      authorityInodeId: inode.id,
+      baseRecordId: this.authoritativeNode(resolved, nodeId).id,
+      candidateRecordId,
+      parentNodeId: null,
+    };
+  }
+
+  private authoritativeNode(resolved: ResolvedSession, nodeId: Id): NodeRecord {
+    return this.records.resolveNodeRecord(nodeId, {
+      ...resolved.view,
+      overlaySessionId: null,
+      overlayHeadRevision: 0,
+    });
+  }
+
+  private authoritativeLink(resolved: ResolvedSession, linkId: Id): LinkRecord {
+    return this.records.resolveLinkRecord(linkId, {
+      ...resolved.view,
+      overlaySessionId: null,
+      overlayHeadRevision: 0,
+    });
+  }
+
+  private writeMode(
+    resolved: ResolvedSession,
+    inodeId: Id,
+    attribute: "content" | "topology",
+    required: number,
+    forceLocal: boolean,
+  ): "main" | "overlay" {
+    if (forceLocal) return "overlay";
+    const inode = this.records.getInode(inodeId);
+    const mode = inode.ownerUserId === resolved.session.userId
+      ? inode.access[attribute] >> 6
+      : inode.groupId !== null && resolved.session.groups.includes(inode.groupId)
+        ? inode.access[attribute] >> 3
+        : inode.access[attribute];
+    return (mode & required) === required ? "main" : "overlay";
   }
 
   private parentLinkHistory(view: View, node: ResolvedNode): Array<{ name: string; records: LinkRecord[] }> {

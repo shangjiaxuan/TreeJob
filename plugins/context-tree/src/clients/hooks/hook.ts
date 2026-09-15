@@ -75,9 +75,8 @@ async function sessionStart(value: HookEvent): Promise<void> {
 }
 
 async function subagentStart(value: HookEvent): Promise<void> {
-  const parent = sessionId(value);
   const child = subagentSessionId(value);
-  await command(parent, ["fork", child], 8_000, eventKey(value, "SubagentStart"));
+  await command(child, ["pwd", value.cwd ?? process.cwd()], 8_000, eventKey(value, "SubagentStart"));
   const briefing = BriefingResultSchema.parse(await command(child, ["briefing"]));
   writeOutput(renderMinimalPath(briefing) + "\n\n" + renderAncestorBriefing(briefing));
 }
@@ -86,7 +85,7 @@ async function subagentStop(value: HookEvent): Promise<void> {
   await command(sessionId(value), ["_submit-proposal", {
     kind: "subagent_result",
     sourceSessionId: subagentSessionId(value),
-    patch: { currentState: value.last_assistant_message ?? "Subagent completed; inspect its frozen branch." },
+    patch: { currentState: value.last_assistant_message ?? "Subagent completed; inspect its private overlay or mailbox candidate." },
   }], 8_000, eventKey(value, "SubagentStop"));
   writeOutput(undefined, "Context Tree saved a subagent proposal.");
 }
